@@ -1,0 +1,72 @@
+# -----------------------------
+# R / RStudio
+# -----------------------------
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# -----------------------------
+# Local environment / private configuration
+# -----------------------------
+.Renviron
+.env
+config.private.R
+config.private*.R
+*.DO_NOT_COMMIT.R
+
+# -----------------------------
+# Rendered R Markdown outputs
+# These can contain participant-level output
+# -----------------------------
+*.html
+*.knit.md
+*.utf8.md
+
+# -----------------------------
+# Raw and processed participant data
+# -----------------------------
+**/data_raw/**
+**/raw/**
+**/data_processed/**
+**/processed/**
+**/measures/**
+
+# Common participant-level data formats
+*.sav
+*.rds
+
+# -----------------------------
+# Linkage / identifying files
+# -----------------------------
+**/*Linkage*.xlsx
+**/*linkage*.xlsx
+**/*Linkage*.csv
+**/*linkage*.csv
+
+# -----------------------------
+# Audit / review / receipt outputs
+# -----------------------------
+**/audit_outputs/**
+**/_receipts/**
+**/receipts/**
+
+**/*identity_ledger*.csv
+**/*_review.csv
+**/*_decisions.csv
+**/*_receipt.csv
+
+# Sociometric identifying/review outputs
+**/S1_sociometric_nomination_name_audit.csv
+**/S2_sociometric_mapping_review.csv
+
+# -----------------------------
+# Local debug outputs
+# -----------------------------
+**/debug_*.csv
+
+# -----------------------------
+# OS-generated files
+# -----------------------------
+.DS_Store
+Thumbs.db
