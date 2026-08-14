@@ -1,0 +1,2644 @@
+---
+title: "Wave 0 Data Cleaning"
+author: "Taylor Guthrie"
+date: "2026-02-20"
+output: html_document
+---
+
+
+> **Repository/privacy note**
+>
+> This repository should contain code and documentation only. Raw survey data,
+> linkage files, editable audit files, receipts, processed participant-level
+> outputs, and rendered HTML are intentionally kept outside version control.
+> Some generated audit files contain direct identifiers (including names and
+> Qualtrics ResponseIds) and must remain in approved secure project storage.
+>
+> Researcher/test names and participant-specific name corrections are loaded
+> from a private configuration file and are intentionally not embedded in this
+> public script.
+>
+> The script is designed as a staged workflow. When a new editable audit file is
+> created, execution stops so that the file can be reviewed manually before the
+> corresponding decisions are applied on the next run.
+
+
+
+
+
+
+
+
+```{r}
+###############################################################################
+#Libraries and data import
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(haven)
+  library(dplyr)
+  library(stringr)
+  library(stringi)
+  library(tibble)
+  library(readxl)
+  library(readr)
+  library(tidyr)
+  library(purrr)
+})
+
+# ---- repository-safe configuration ----
+# Keep the private data root outside the Git repository.
+# Example (Windows, set in ~/.Renviron):
+#   GUTS_DATA_ROOT=X:/secure/project/data
+dir0 <- Sys.getenv("GUTS_DATA_ROOT", unset = "")
+if (!nzchar(dir0)) {
+  stop(
+    "GUTS_DATA_ROOT is not set. Point it to the private project data root ",
+    "before running this pipeline."
+  )
+}
+dir0 <- normalizePath(dir0, winslash = "/", mustWork = TRUE)
+
+# Optional private configuration for researcher/test names and participant-
+# specific linkage corrections. Keep this file outside the repository.
+# It may define:
+#   researcher_names
+#   linkage_name_patches
+private_config <- Sys.getenv("GUTS_PRIVATE_CONFIG", unset = "")
+if (nzchar(private_config)) {
+  if (!file.exists(private_config)) {
+    stop("GUTS_PRIVATE_CONFIG does not exist: ", private_config)
+  }
+  source(private_config, local = TRUE)
+}
+
+# Avoid embedding participant-level console output in rendered HTML.
+knitr::opts_chunk$set(
+  echo = TRUE,
+  results = "hide",
+  message = FALSE,
+  warning = FALSE
+)
+
+# ---- raw file paths (Wave-specific) ----
+paths <- list(
+  ic_wave0   = file.path(dir0, "behavioral/T0/data_raw/T0+GUTS+WP2+Informed+Consent_January+15,+2026_04.03.sav"),
+  demo_wave0 = file.path(dir0, "behavioral/T0/data_raw/T0+GUTS+WP2+Sensitive+Data_January+15,+2026_04.06.sav"),
+  survey_wave0 = file.path(dir0, "behavioral/T0/data_raw/T0+GUTS+WP2+Survey_January+15,+2026_04.07.sav"),
+  linkage    = file.path(dir0, "T1_Behavioral/Hackathon/GUTS_WP2_Linkage.xlsx")
+)
+
+read_sav_tagged <- function(path, label) {
+  stopifnot(file.exists(path))
+  df <- read_sav(path) %>% as_tibble()
+  message(label, ": ", nrow(df), " rows, ", ncol(df), " cols")
+  df
+}
+
+# ---- read everything ----
+ic_wave0       <- read_sav_tagged(paths$ic_wave0, "ic_wave0")
+demo_raw_wave0 <- read_sav_tagged(paths$demo_wave0, "demo_raw_wave0")
+survey_wave0   <- read_sav_tagged(paths$survey_wave0, "survey_wave0")
+
+linkage <- read_excel(paths$linkage) %>% as_tibble()
+message("linkage: ", nrow(linkage), " rows, ", ncol(linkage), " cols")
+
+
+```
+
+
+```{r}
+###############################################################################
+#Helper functions: names and dates
+###############################################################################
+# These helpers standardize names and timestamps so comparisons behave
+# consistently across SPSS imports and Qualtrics exports.
+#
+# clean_name():
+#   - produces a lowercase, whitespace-squished, NFC-normalized string
+#   - used as the stable matching key for identity operations
+#
+# title_case_name():
+#   - title-cases names for later matching to linkage (human-readable form)
+#
+# fix_tussenvoegsels():
+#   - normalizes common Dutch tussenvoegsels after title-casing
+#   - improves linkage later when matching to the master linkage file
+#
+# parse_dt_any():
+#   - parses timestamp formats observed across files
+#   - returns POSIXct in UTC for consistent comparisons
+###############################################################################
+
+clean_name <- function(x) {
+  x %>%
+    as.character() %>%
+    str_squish() %>%
+    str_to_lower() %>%
+    stringi::stri_trans_nfc()
+}
+
+title_case_name <- function(x) {
+  x %>%
+    as.character() %>%
+    str_squish() %>%
+    str_to_title()
+}
+
+fix_tussenvoegsels <- function(x) {
+  x %>%
+    str_replace_all("\\sVan\\s", " van ") %>%
+    str_replace_all("\\sDer\\s", " der ") %>%
+    str_replace_all("\\sDe\\s",  " de ") %>%
+    str_replace_all("\\sDen\\s", " den ") %>%
+    str_replace_all("\\sTer\\s", " ter ") %>%
+    str_replace_all("\\sLe\\s",  " le ") %>%
+    str_replace_all("\\sTot\\s", " tot ")
+}
+
+parse_dt_any <- function(x) {
+  x <- as.character(x)
+  out1 <- suppressWarnings(as.POSIXct(x, format = "%Y-%m-%d %H:%M:%S", tz = "UTC"))
+  out2 <- suppressWarnings(as.POSIXct(x, format = "%d-%b-%Y %H:%M:%S", tz = "UTC"))
+  out  <- ifelse(!is.na(out1), out1, out2)
+  as.POSIXct(out, tz = "UTC", origin = "1970-01-01")
+}
+
+convert_dates <- function(df) {
+  df %>%
+    mutate(
+      StartDate = parse_dt_any(StartDate),
+      EndDate   = parse_dt_any(EndDate)
+    )
+}
+
+# ---- apply date parsing (Wave 0 already does this; now standardized) ----
+ic_wave0        <- convert_dates(ic_wave0)
+demo_raw_wave0  <- convert_dates(demo_raw_wave0)
+survey_wave0    <- convert_dates(survey_wave0)
+
+```
+
+
+
+```{r}
+###############################################################################
+#Audit IO helpers (WRITE -> EDIT -> READ -> APPLY)
+###############################################################################
+# Each audit step writes a small CSV to audit_dir. You edit it once,
+# re-import it, and we apply the decisions before the next step.
+###############################################################################
+
+audit_dir <- file.path(dir0, "behavioral", "T0", "audit_outputs")
+if (!dir.exists(audit_dir)) dir.create(audit_dir, recursive = TRUE)
+
+write_audit_csv <- function(df, filename) {
+  out_path <- file.path(audit_dir, filename)
+  write.csv2(df, file = out_path, row.names = FALSE, na = "")
+  message("Wrote audit file: ", out_path)
+  invisible(out_path)
+}
+
+read_audit_csv2 <- function(filename) {
+  in_path <- file.path(audit_dir, filename)
+  stopifnot(file.exists(in_path))
+  read.csv2(in_path, stringsAsFactors = FALSE)
+}
+
+# Editable audit files are deliberately different from read-only reports.
+# On first creation, stop execution if there are rows to review. On later runs,
+# preserve the edited file rather than overwriting the reviewer's decisions.
+write_review_csv <- function(df, filename) {
+  out_path <- file.path(audit_dir, filename)
+
+  if (file.exists(out_path)) {
+    message("Using existing review file: ", out_path)
+    return(invisible(out_path))
+  }
+
+  write.csv2(df, file = out_path, row.names = FALSE, na = "")
+  message("Wrote review file: ", out_path)
+
+  if (nrow(df) > 0) {
+    stop(
+      "Manual review required. Edit the decision columns in ", filename,
+      " in secure project storage, then re-run this audit step."
+    )
+  }
+
+  invisible(out_path)
+}
+
+```
+
+
+
+```{r}
+###############################################################################
+# Audit Step A (Wave 0): Identify and remove test responses
+#
+# Goal
+# Remove researcher/test activity as early as possible. In Wave 0, the Informed
+# Consent (IC) file is the only place where participant names exist. The IC
+# Qualtrics ResponseId is treated as the canonical participant identifier (PPN)
+# that should propagate downstream into Sensitive Data (demo) and Survey.
+#
+# Strategy
+# Audit Step A has four stages:
+#   A1. Construct the full IC universe for the wave and compute conservative
+#       test flags (FLAG ONLY).
+#   A2. Write one self-contained review file for flagged IC ResponseIds.
+#   A3. Re-import the edited review file and drop ResponseIds marked as tests.
+#   A4. Propagate the drops globally by removing those PPNs from downstream
+#       datasets (demo + survey).
+#
+# Outputs
+#   - A_test_drop_decisions.csv   (EDIT THIS FILE)
+#
+# Notes
+# - Because names do not exist outside IC in Wave 0, we cannot do the Wave 1
+#   “FC name → IC name → PPN” tracing. Step A therefore relies on IC date/name
+#   flags plus human review in the audit CSV.
+###############################################################################
+
+
+###############################################################################
+# A1. Build the IC universe and compute conservative test flags (flag only)
+###############################################################################
+
+# ---- WAVE 0 SPECIFIC: official launch time ----
+# Entries before this time are strong candidates for piloting/testing.
+real_start <- as.POSIXct("2024-10-11 00:00:00", tz = "UTC")
+
+# ---- WAVE 0 SPECIFIC: researcher/test names (best effort) ----
+# These are only used to FLAG; final keep/drop is decided in the audit CSV.
+# Keep this list broad; the audit file is the true decision layer.
+if (!exists("researcher_names", inherits = FALSE)) {
+  researcher_names <- character(0)
+}
+
+researcher_names_clean <- clean_name(researcher_names)
+
+# Standardize IC fields for consistent auditing
+ic_combined <- ic_wave0 %>%
+  rename(Name = ic_name) %>%
+  mutate(
+    StartDate_posix = parse_dt_any(StartDate),
+    EndDate_posix   = parse_dt_any(EndDate),
+    ResponseId      = as.character(ResponseId),
+    ppn             = as.character(ppn),
+
+    # Title-case for human readability + tussenvoegsels cleanup
+    Name_title      = fix_tussenvoegsels(str_to_title(as.character(Name))),
+    Name_clean      = clean_name(Name_title),
+
+    # Flag only
+    flag_test_by_date = !is.na(StartDate_posix) & StartDate_posix < real_start,
+
+    # Exact match list or literal 'test' token in the name (flag only)
+    flag_test_by_name = ifelse(
+      is.na(Name_clean) | Name_clean == "",
+      FALSE,
+      (Name_clean %in% researcher_names_clean) | str_detect(Name_clean, "\\btest\\b")
+    )
+  )
+
+# IC ledger for auditing: full IC universe with flags but no decisions applied
+ic_ledger_raw <- ic_combined %>%
+  select(
+    Name, Name_title, Name_clean,
+    ResponseId, ppn,
+    StartDate, EndDate, StartDate_posix, EndDate_posix,
+    flag_test_by_date, flag_test_by_name
+  )
+
+
+###############################################################################
+# A2. WRITE: export one review file for flagged IC ResponseIds (edit decisions)
+###############################################################################
+# Editable fields:
+#   - keep
+#   - drop_reason
+#   - notes
+#
+# Do not edit:
+#   - ResponseId
+#   - Name_clean
+###############################################################################
+
+test_rows_review <- ic_ledger_raw %>%
+  mutate(
+    flag_test = flag_test_by_date | flag_test_by_name,
+    test_reason = case_when(
+      flag_test_by_date & flag_test_by_name ~ "prelaunch + researcher_name_or_test",
+      flag_test_by_date ~ "prelaunch",
+      flag_test_by_name ~ "researcher_name_or_test",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(flag_test) %>%
+  arrange(StartDate_posix) %>%
+  select(
+    Name, Name_title, Name_clean,
+    ResponseId, ppn,
+    StartDate_posix, EndDate_posix,
+    flag_test_by_date, flag_test_by_name, test_reason
+  )
+
+test_drop_decisions_template <- test_rows_review %>%
+  transmute(
+    # identity keys (do not edit)
+    ResponseId,
+    Name_title,
+    Name_clean,
+
+    # audit context
+    StartDate_posix,
+    EndDate_posix,
+    flag_test_by_date,
+    flag_test_by_name,
+    test_reason,
+
+    # editable decisions
+    keep = FALSE,
+    drop_reason = test_reason,
+    notes = ""
+  )
+
+write_review_csv(test_drop_decisions_template, "A_test_drop_decisions.csv")
+
+
+###############################################################################
+# A3. READ + APPLY: re-import the edited decisions and drop marked tests
+###############################################################################
+
+test_drop_decisions <- read_audit_csv2("A_test_drop_decisions.csv")
+
+# Guardrails: prevent deletions/reordering of the audit universe
+stopifnot(all(test_drop_decisions$ResponseId %in% test_drop_decisions_template$ResponseId))
+stopifnot(all(test_drop_decisions$ResponseId == test_drop_decisions_template$ResponseId))
+
+drop_test_responseids <- test_drop_decisions %>%
+  filter(keep == FALSE) %>%
+  pull(ResponseId) %>%
+  unique()
+
+# Apply drops to IC (create post Step A working IC objects)
+ic_combined_working <- ic_combined %>%
+  filter(!(ResponseId %in% drop_test_responseids))
+
+ic_ledger_working <- ic_ledger_raw %>%
+  filter(!(ResponseId %in% drop_test_responseids))
+
+
+#rename ppn column in survey file to match structure of other datasets 
+survey_wave0 <- survey_wave0 %>%
+  rename(ppn = ppn_) %>%
+  mutate(ppn = as.character(ppn)) %>%
+  filter(!(ppn %in% drop_test_responseids))
+
+
+###############################################################################
+# A4. APPLY GLOBALLY: remove dropped test PPNs from downstream datasets
+###############################################################################
+# In Wave 0, downstream datasets store IC ResponseId as `ppn`. Therefore, any
+# IC ResponseId dropped in Step A should be removed from demo and survey via
+# their `ppn` field.
+#
+# Implementation note:
+# We overwrite ic_combined and ic_ledger_raw to keep later steps clean.
+###############################################################################
+
+# 1) IC: overwrite the main objects used downstream in the script
+ic_combined <- ic_combined_working
+ic_ledger_raw <- ic_ledger_working
+
+
+# 2) Downstream datasets: drop by PPN
+demo_raw_wave0 <- demo_raw_wave0 %>%
+  mutate(ppn = as.character(ppn)) %>%
+  filter(!(ppn %in% drop_test_responseids))
+
+survey_wave0 <- survey_wave0 %>%
+  mutate(ppn = as.character(ppn)) %>%
+  filter(!(ppn %in% drop_test_responseids))
+
+
+###############################################################################
+# Post Step A standardization: add parsed timestamps to downstream datasets
+###############################################################################
+# Not a new audit step. It prepares demo + survey for later audit steps that
+# use time matching, completion checks, or duplicate resolution.
+###############################################################################
+
+demo_raw_wave0 <- demo_raw_wave0 %>%
+  mutate(
+    ppn = as.character(ppn),
+    StartDate_posix = parse_dt_any(StartDate),
+    EndDate_posix   = parse_dt_any(EndDate)
+  )
+
+survey_wave0 <- survey_wave0 %>%
+  mutate(
+    ppn = as.character(ppn),
+    StartDate_posix = parse_dt_any(StartDate),
+    EndDate_posix   = parse_dt_any(EndDate)
+  )
+
+```
+
+
+
+```{r}
+###############################################################################
+# AUDIT STEP B (Wave 0): missing ppn in main survey chain (Survey -> Demo -> IC)
+#   Output: ONE review file + receipts written to receipts/ subfolder
+###############################################################################
+# Prereqs expected in environment (from earlier sections):
+#   - audit_dir, write_audit_csv(), read_audit_csv2()
+#   - parse_dt_any(), clean_name(), fix_tussenvoegsels()
+#   - ic_combined (or ic_combined_working after Step A test drops)
+#   - demo_raw_wave0, survey_wave0
+###############################################################################
+
+# -------------------------
+# 0) Parameters + folders
+# -------------------------
+tolerance_secs <- 2
+
+receipts_dir <- file.path(audit_dir, "receipts")
+if (!dir.exists(receipts_dir)) dir.create(receipts_dir, recursive = TRUE)
+
+write_receipt_csv <- function(df, filename) {
+  out_path <- file.path(receipts_dir, filename)
+  write.csv2(df, file = out_path, row.names = FALSE, na = "")
+  message("Wrote receipt file: ", out_path)
+  invisible(out_path)
+}
+
+# -------------------------
+# 1) Local helpers (self-contained for this section)
+# -------------------------
+is_missing_ppn <- function(x) {
+  x2 <- trimws(as.character(x))
+  is.na(x2) | x2 == ""
+}
+
+has_missing_ppn <- function(df, col = "ppn") {
+  if (!col %in% names(df)) return(FALSE)
+  any(is_missing_ppn(df[[col]]))
+}
+
+# Strict time match helper:
+# Returns best match index + diagnostics, or NA if nothing within tolerance.
+time_match_one <- function(target_time, candidate_times, tolerance_secs) {
+  if (is.na(target_time) || length(candidate_times) == 0) {
+    return(list(best_index = NA_integer_, best_abs_diff = NA_real_, n_within_tol = 0L))
+  }
+  diffs_abs <- abs(as.numeric(difftime(candidate_times, target_time, units = "secs")))
+  n_within <- sum(diffs_abs <= tolerance_secs, na.rm = TRUE)
+  if (all(is.na(diffs_abs))) {
+    return(list(best_index = NA_integer_, best_abs_diff = NA_real_, n_within_tol = as.integer(n_within)))
+  }
+  best_idx <- which.min(diffs_abs)
+  best_abs <- diffs_abs[best_idx]
+  if (is.na(best_abs) || best_abs > tolerance_secs) {
+    return(list(best_index = NA_integer_, best_abs_diff = best_abs, n_within_tol = as.integer(n_within)))
+  }
+  list(best_index = as.integer(best_idx), best_abs_diff = as.numeric(best_abs), n_within_tol = as.integer(n_within))
+}
+
+# -------------------------
+# 2) Standardize timestamps + key fields used for matching
+#    (do not assume earlier sections created *_posix)
+# -------------------------
+
+# Choose IC source post Step A test drops if present
+ic_source <- if (exists("ic_combined_working")) ic_combined_working else ic_combined
+
+# IC provides canonical PPN as ResponseId (ppn may or may not exist)
+ic_B <- ic_source %>%
+  dplyr::mutate(
+    ic_row_id = dplyr::row_number(),
+    ResponseId = trimws(as.character(ResponseId)),
+    ppn_ic = ResponseId,
+    StartDate_posix = parse_dt_any(StartDate),
+    EndDate_posix   = parse_dt_any(EndDate)
+  )
+
+demo_B <- demo_raw_wave0 %>%
+  dplyr::mutate(
+    row_id = dplyr::row_number(),
+    ppn = trimws(as.character(ppn)),
+    StartDate_posix = parse_dt_any(StartDate),
+    EndDate_posix   = parse_dt_any(EndDate)
+  )
+
+survey_B <- survey_wave0 %>%
+  dplyr::mutate(
+    row_id = dplyr::row_number(),
+    ppn = trimws(as.character(ppn)),
+    StartDate_posix = parse_dt_any(StartDate),
+    EndDate_posix   = parse_dt_any(EndDate)
+  )
+
+# -------------------------
+# 3) Preflight: do we need any repairs?
+# -------------------------
+need_fix_survey <- has_missing_ppn(survey_B, "ppn")
+need_fix_demo   <- has_missing_ppn(demo_B, "ppn")
+
+# Always create objects so downstream code never fails
+survey_review_tbl <- tibble::tibble()
+demo_review_tbl   <- tibble::tibble()
+
+# -------------------------
+# 4) Build Survey suggestions (closest to “end of chain”)
+#    Match Survey StartDate to Demo EndDate, then inherit Demo ppn.
+# -------------------------
+if (need_fix_survey) {
+
+  survey_missing <- survey_B %>%
+    dplyr::filter(is_missing_ppn(ppn)) %>%
+    dplyr::transmute(
+      component = "survey",
+      row_id,
+      StartDate_posix,
+      EndDate_posix,
+      match_target_time = StartDate_posix
+    )
+
+  survey_review_tbl <- survey_missing %>%
+    dplyr::rowwise() %>%
+    dplyr::mutate(
+      .m = list(time_match_one(match_target_time, demo_B$EndDate_posix, tolerance_secs)),
+      demo_row_id = .m$best_index,
+      demo_best_abs_diff = .m$best_abs_diff,
+      demo_n_within_tol = .m$n_within_tol,
+      demo_within_tol = !is.na(demo_row_id),
+
+      demo_StartDate_posix = if (demo_within_tol) demo_B$StartDate_posix[demo_row_id] else as.POSIXct(NA),
+      demo_EndDate_posix   = if (demo_within_tol) demo_B$EndDate_posix[demo_row_id] else as.POSIXct(NA),
+      demo_ppn_raw         = if (demo_within_tol) demo_B$ppn[demo_row_id] else NA_character_,
+
+      # signed delta for audit (demo end - survey start)
+      demo_time_diff_secs = if (demo_within_tol)
+        as.numeric(difftime(demo_EndDate_posix, match_target_time, units = "secs"))
+      else NA_real_
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      suggested_ppn = dplyr::case_when(
+        demo_within_tol & !is.na(demo_ppn_raw) & trimws(demo_ppn_raw) != "" ~ demo_ppn_raw,
+        TRUE ~ NA_character_
+      ),
+      suggestion_status = dplyr::case_when(
+        is.na(StartDate_posix) ~ "missing_survey_startdate",
+        is.na(demo_row_id) ~ "no_demo_time_match",
+        is.na(demo_ppn_raw) | trimws(demo_ppn_raw) == "" ~ "matched_demo_but_demo_ppn_missing",
+        TRUE ~ "inherited_from_demo"
+      ),
+      recommend_apply = !is.na(suggested_ppn) & trimws(suggested_ppn) != ""
+    ) %>%
+    dplyr::select(
+      component, row_id,
+      StartDate_posix, EndDate_posix,
+
+      # Demo evidence
+      demo_row_id,
+      demo_StartDate_posix, demo_EndDate_posix,
+      demo_ppn_raw,
+      demo_time_diff_secs,
+      demo_n_within_tol,
+
+      # suggestion
+      suggested_ppn,
+      suggestion_status,
+      recommend_apply
+    )
+}
+
+# Build a temporary Survey ppn map from suggestions (used only for diagnostics if needed)
+survey_suggested_map <- survey_review_tbl %>%
+  dplyr::filter(!is.na(suggested_ppn) & trimws(suggested_ppn) != "") %>%
+  dplyr::transmute(
+    survey_row_id = row_id,
+    survey_suggested_ppn = suggested_ppn,
+    survey_suggestion_status = suggestion_status
+  )
+
+# Create a Survey working proposal (NOT yet applied; used only if you want later steps)
+survey_working_proposal <- survey_B %>%
+  dplyr::left_join(survey_suggested_map, by = c("row_id" = "survey_row_id")) %>%
+  dplyr::mutate(
+    ppn_proposed = dplyr::if_else(
+      is_missing_ppn(ppn) & !is.na(survey_suggested_ppn) & trimws(survey_suggested_ppn) != "",
+      survey_suggested_ppn,
+      ppn
+    )
+  )
+
+# -------------------------
+# 5) Build Demo suggestions
+#    Match Demo StartDate to IC EndDate, then inherit IC ResponseId (canonical PPN).
+# -------------------------
+if (need_fix_demo) {
+
+  demo_missing <- demo_B %>%
+    dplyr::filter(is_missing_ppn(ppn)) %>%
+    dplyr::transmute(
+      component = "demo",
+      row_id,
+      StartDate_posix,
+      EndDate_posix,
+      match_target_time = StartDate_posix
+    )
+
+  demo_review_tbl <- demo_missing %>%
+    dplyr::rowwise() %>%
+    dplyr::mutate(
+      .m = list(time_match_one(match_target_time, ic_B$EndDate_posix, tolerance_secs)),
+      ic_row_id = .m$best_index,
+      ic_best_abs_diff = .m$best_abs_diff,
+      ic_n_within_tol = .m$n_within_tol,
+      ic_within_tol = !is.na(ic_row_id),
+
+      ic_StartDate_posix = if (ic_within_tol) ic_B$StartDate_posix[ic_row_id] else as.POSIXct(NA),
+      ic_EndDate_posix   = if (ic_within_tol) ic_B$EndDate_posix[ic_row_id] else as.POSIXct(NA),
+      ic_ppn             = if (ic_within_tol) ic_B$ppn_ic[ic_row_id] else NA_character_,
+
+      # signed delta for audit (ic end - demo start)
+      ic_time_diff_secs = if (ic_within_tol)
+        as.numeric(difftime(ic_EndDate_posix, match_target_time, units = "secs"))
+      else NA_real_
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      suggested_ppn = dplyr::case_when(
+        ic_within_tol & !is.na(ic_ppn) & trimws(ic_ppn) != "" ~ ic_ppn,
+        TRUE ~ NA_character_
+      ),
+      suggestion_status = dplyr::case_when(
+        is.na(StartDate_posix) ~ "missing_demo_startdate",
+        is.na(ic_row_id) ~ "no_ic_time_match",
+        is.na(ic_ppn) | trimws(ic_ppn) == "" ~ "matched_ic_but_ic_ppn_missing",
+        TRUE ~ "inherited_from_ic"
+      ),
+      recommend_apply = !is.na(suggested_ppn) & trimws(suggested_ppn) != ""
+    ) %>%
+    dplyr::select(
+      component, row_id,
+      StartDate_posix, EndDate_posix,
+
+      # IC evidence
+      ic_row_id,
+      ic_StartDate_posix, ic_EndDate_posix,
+      ic_ppn,
+      ic_time_diff_secs,
+      ic_n_within_tol,
+
+      # suggestion
+      suggested_ppn,
+      suggestion_status,
+      recommend_apply
+    )
+}
+
+# -------------------------
+# 6) Write ONE combined review file (even if empty)
+# -------------------------
+review_tbl <- dplyr::bind_rows(
+  survey_review_tbl,
+  demo_review_tbl
+)
+
+review_out <- review_tbl %>%
+  dplyr::mutate(
+    apply_fix = recommend_apply,
+    ppn_new = "",
+    notes = ""
+  ) %>%
+  dplyr::arrange(component, dplyr::desc(recommend_apply))
+
+if (nrow(review_out) == 0) {
+  review_out <- tibble::tibble(
+    component = character(),
+    row_id = integer(),
+    StartDate_posix = as.POSIXct(character()),
+    EndDate_posix = as.POSIXct(character()),
+    suggested_ppn = character(),
+    suggestion_status = character(),
+    recommend_apply = logical(),
+    apply_fix = logical(),
+    ppn_new = character(),
+    notes = character()
+  )
+}
+
+write_review_csv(review_out, "B_missing_ppn_review.csv")
+
+# -------------------------
+# 7) Re-import edited review + apply fixes
+# -------------------------
+review_edited <- read_audit_csv2("B_missing_ppn_review.csv") %>%
+  dplyr::mutate(
+    component = as.character(component),
+    row_id = suppressWarnings(as.integer(row_id)),
+    apply_fix = as.logical(apply_fix),
+    ppn_new = as.character(ppn_new),
+    suggested_ppn = as.character(suggested_ppn),
+    ppn_to_apply = dplyr::if_else(
+      !is.na(ppn_new) & trimws(ppn_new) != "",
+      trimws(ppn_new),
+      trimws(suggested_ppn)
+    )
+  )
+
+stopifnot(!any(is.na(review_edited$row_id)))
+
+fixes_to_apply <- review_edited %>%
+  dplyr::filter(apply_fix == TRUE) %>%
+  dplyr::filter(!is.na(ppn_to_apply) & trimws(ppn_to_apply) != "") %>%
+  dplyr::select(component, row_id, ppn_to_apply, suggestion_status, recommend_apply, notes)
+
+# Always define working outputs
+survey_working <- survey_B
+demo_working   <- demo_B
+
+if (nrow(fixes_to_apply) > 0) {
+
+  # ---- (1) apply Survey fixes ----
+  survey_fixes <- fixes_to_apply %>% dplyr::filter(component == "survey")
+  if (nrow(survey_fixes) > 0) {
+    survey_working <- survey_B %>%
+      dplyr::left_join(survey_fixes %>% dplyr::select(row_id, ppn_to_apply), by = "row_id") %>%
+      dplyr::mutate(
+        ppn_before = ppn,
+        ppn = dplyr::if_else(is_missing_ppn(ppn) & !is.na(ppn_to_apply) & trimws(ppn_to_apply) != "", ppn_to_apply, ppn)
+      ) %>%
+      dplyr::select(-ppn_to_apply)
+
+    survey_receipt <- survey_B %>%
+      dplyr::mutate(ppn_before = ppn) %>%
+      dplyr::left_join(survey_fixes, by = "row_id") %>%
+      dplyr::left_join(
+        survey_working %>% dplyr::select(row_id, ppn_after = ppn),
+        by = "row_id"
+      ) %>%
+      dplyr::filter(is_missing_ppn(ppn_before) & !is.na(ppn_to_apply) & trimws(ppn_to_apply) != "") %>%
+      dplyr::transmute(component = "survey", row_id, ppn_before, ppn_after, ppn_to_apply, suggestion_status, recommend_apply, notes)
+
+    write_receipt_csv(survey_receipt, "B_missing_ppn_receipt_survey.csv")
+  }
+
+  # ---- (2) apply Demo fixes ----
+  demo_fixes <- fixes_to_apply %>% dplyr::filter(component == "demo")
+  if (nrow(demo_fixes) > 0) {
+    demo_working <- demo_B %>%
+      dplyr::left_join(demo_fixes %>% dplyr::select(row_id, ppn_to_apply), by = "row_id") %>%
+      dplyr::mutate(
+        ppn_before = ppn,
+        ppn = dplyr::if_else(is_missing_ppn(ppn) & !is.na(ppn_to_apply) & trimws(ppn_to_apply) != "", ppn_to_apply, ppn)
+      ) %>%
+      dplyr::select(-ppn_to_apply)
+
+    demo_receipt <- demo_B %>%
+      dplyr::mutate(ppn_before = ppn) %>%
+      dplyr::left_join(demo_fixes, by = "row_id") %>%
+      dplyr::left_join(
+        demo_working %>% dplyr::select(row_id, ppn_after = ppn),
+        by = "row_id"
+      ) %>%
+      dplyr::filter(is_missing_ppn(ppn_before) & !is.na(ppn_to_apply) & trimws(ppn_to_apply) != "") %>%
+      dplyr::transmute(component = "demo", row_id, ppn_before, ppn_after, ppn_to_apply, suggestion_status, recommend_apply, notes)
+
+    write_receipt_csv(demo_receipt, "B_missing_ppn_receipt_demo.csv")
+  }
+}
+
+# -------------------------
+# 8) Final objects exported by this step (for downstream sections)
+# -------------------------
+# Use these moving forward:
+#   - survey_working
+#   - demo_working
+#
+# Keep these for traceability:
+#   - review_out (written)
+#   - review_edited
+#   - fixes_to_apply
+###############################################################################
+
+```
+
+
+
+```{r}
+###############################################################################
+# AUDIT STEP C (Wave 0): resolve shared ppn within downstream dataset
+#
+# Goal
+# Detect cases where the same ppn appears more than once WITHIN demo or
+# WITHIN survey. This usually indicates that a participant shared their
+# survey link after completing IC.
+#
+# Because Wave 0 lacks the financial compensation anchor used in Wave 1,
+# we attempt to recover the most plausible continuation of the IC case
+# using timing continuity.
+#
+# Strategy
+#   C1. Detect duplicated ppns within demo or survey.
+#   C2. Attach IC anchor timing evidence.
+#   C3. Rank rows by temporal plausibility.
+#   C4. Auto-mark the best candidate as keep=TRUE.
+#   C5. Auto-mark all other rows as keep=FALSE and flag_review=TRUE.
+#   C6. Write one review file for manual inspection.
+#   C7. Read edited file back in and apply keep/drop decisions.
+#   C8. Write one receipt showing rows actually removed.
+#
+# Outputs
+#   - C_shared_ppn_review.csv
+#   - receipts/C_shared_ppn_receipt.csv
+###############################################################################
+
+# -------------------------
+# C0) Choose working objects
+# -------------------------
+
+demo_C <- if (exists("demo_working")) demo_working else demo_raw_wave0
+survey_C <- if (exists("survey_working")) survey_working else survey_wave0
+
+demo_C <- demo_C %>%
+  mutate(
+    row_id = if ("row_id" %in% names(.)) row_id else dplyr::row_number(),
+    ppn = as.character(ppn),
+    StartDate_posix = if ("StartDate_posix" %in% names(.)) StartDate_posix else parse_dt_any(StartDate),
+    EndDate_posix   = if ("EndDate_posix" %in% names(.)) EndDate_posix else parse_dt_any(EndDate)
+  )
+
+survey_C <- survey_C %>%
+  mutate(
+    row_id = if ("row_id" %in% names(.)) row_id else dplyr::row_number(),
+    ppn = as.character(ppn),
+    StartDate_posix = if ("StartDate_posix" %in% names(.)) StartDate_posix else parse_dt_any(StartDate),
+    EndDate_posix   = if ("EndDate_posix" %in% names(.)) EndDate_posix else parse_dt_any(EndDate)
+  )
+
+# IC anchor
+ic_C <- ic_combined %>%
+  mutate(
+    ic_ppn = as.character(ResponseId),
+    ic_name = dplyr::coalesce(
+      if ("Name_title" %in% names(.)) as.character(Name_title) else NA_character_,
+      if ("Name" %in% names(.)) as.character(Name) else NA_character_,
+      if ("Name_clean" %in% names(.)) as.character(Name_clean) else NA_character_
+    ),
+    ic_EndDate_posix = if ("EndDate_posix" %in% names(.)) EndDate_posix else parse_dt_any(EndDate)
+  ) %>%
+  select(ic_ppn, ic_name, ic_EndDate_posix)
+
+# -------------------------
+# C1) Detect duplicated ppn within dataset
+# -------------------------
+
+downstream_C <- bind_rows(
+  demo_C %>% mutate(component = "demo"),
+  survey_C %>% mutate(component = "survey")
+)
+
+shared_ppn_summary <- downstream_C %>%
+  filter(!is_missing_ppn(ppn)) %>%
+  group_by(component, ppn) %>%
+  summarise(n_rows = n(), .groups = "drop") %>%
+  filter(n_rows > 1)
+
+shared_keys <- shared_ppn_summary %>%
+  mutate(shared_key = paste(component, ppn, sep = "|||")) %>%
+  pull(shared_key)
+
+candidate_rows <- downstream_C %>%
+  mutate(shared_key = paste(component, ppn, sep = "|||")) %>%
+  filter(shared_key %in% shared_keys) %>%
+  left_join(ic_C, by = c("ppn" = "ic_ppn")) %>%
+  arrange(component, ppn, row_id)
+
+# -------------------------
+# C2) Attach timing evidence
+# -------------------------
+
+candidate_rows_scored <- candidate_rows %>%
+  mutate(
+    ic_to_start_diff_secs =
+      abs(as.numeric(difftime(StartDate_posix, ic_EndDate_posix, units = "secs")))
+  ) %>%
+  group_by(component, ppn) %>%
+  mutate(
+    evidence_score = ic_to_start_diff_secs,
+    rank_within_shared_ppn =
+      rank(evidence_score, ties.method = "first", na.last = "keep"),
+    n_rows_with_same_ppn = n()
+  ) %>%
+  ungroup()
+
+# -------------------------
+# C3) WRITE review file
+# -------------------------
+
+review_out <- candidate_rows_scored %>%
+  mutate(
+    keep = rank_within_shared_ppn == 1,
+    flag_review = rank_within_shared_ppn != 1,
+    keep_reason = case_when(
+      rank_within_shared_ppn == 1 ~ "best_timing_match_to_ic",
+      TRUE ~ "shared_ppn_secondary_row"
+    )
+  ) %>%
+  transmute(
+    component,
+    row_id,
+    ppn_current = ppn,
+    StartDate_posix,
+    EndDate_posix,
+    ic_name,
+    ic_EndDate_posix,
+    ic_to_start_diff_secs,
+    evidence_score,
+    rank_within_shared_ppn,
+    n_rows_with_same_ppn,
+
+    keep,
+    flag_review,
+    keep_reason,
+    notes = ""
+  ) %>%
+  arrange(component, ppn_current, rank_within_shared_ppn)
+
+write_review_csv(review_out, "C_shared_ppn_review.csv")
+
+# -------------------------
+# C4) READ edited review file
+# -------------------------
+
+review_edited <- read_audit_csv2("C_shared_ppn_review.csv") %>%
+  mutate(
+    component = as.character(component),
+    row_id = as.integer(row_id),
+    keep = as.logical(keep),
+    flag_review = as.logical(flag_review),
+    keep_reason = as.character(keep_reason),
+    notes = as.character(notes)
+  )
+
+stopifnot(!any(is.na(review_edited$row_id)))
+
+rows_to_drop <- review_edited %>%
+  filter(keep == FALSE)
+
+# -------------------------
+# C5) APPLY decisions
+# -------------------------
+
+demo_working_C <- demo_C
+survey_working_C <- survey_C
+
+demo_drop <- rows_to_drop %>% filter(component == "demo")
+
+if (nrow(demo_drop) > 0) {
+  demo_working_C <- demo_C %>%
+    anti_join(demo_drop %>% select(row_id), by = "row_id")
+}
+
+survey_drop <- rows_to_drop %>% filter(component == "survey")
+
+if (nrow(survey_drop) > 0) {
+  survey_working_C <- survey_C %>%
+    anti_join(survey_drop %>% select(row_id), by = "row_id")
+}
+
+demo_working <- demo_working_C
+survey_working <- survey_working_C
+
+# -------------------------
+# C6) WRITE receipt
+# -------------------------
+
+receipt_out <- rows_to_drop %>%
+  transmute(
+    component,
+    row_id,
+    keep = FALSE,
+    flag_review,
+    keep_reason,
+    notes
+  ) %>%
+  arrange(component, row_id)
+
+write_receipt_csv(receipt_out, "C_shared_ppn_receipt.csv")
+
+###############################################################################
+# Final objects exported by this step
+#   demo_working
+#   survey_working
+###############################################################################
+
+
+
+```
+
+
+
+```{r}
+###############################################################################
+# AUDIT STEP D (Wave 0): IC restarters (same name, multiple IC ResponseIds)
+###############################################################################
+# Purpose:
+#   Detect IC "restarts" (same cleaned name submitted IC more than once) and use
+#   downstream evidence to select ONE canonical IC ResponseId per identity.
+#
+# Key idea:
+#   IC ResponseId is treated as the wave canonical participant identifier (ppn).
+#   When a person restarts IC, we must choose a single canonical ResponseId so
+#   that all downstream linkage is stable.
+#
+# Inputs expected to exist by this stage:
+#   - ic_ledger_working  (IC after Audit Step A test removals)
+#   - demo_working2      (after missing ppn repairs and shared ppn repairs)
+#   - survey_working2
+#
+# Output strategy (audit_dir):
+#   - D_identity_ledger.csv        (read only, one row per identity)
+#   - D_identity_review_queue.csv  (editable, only restart cases needing review)
+#
+# Receipt output (receipts_dir if available, otherwise audit_dir):
+#   - D_identity_review_applied.csv  (only override and drop decisions)
+#
+# Review decisions (editable in D_identity_review_queue.csv):
+#   - decision: accept / override / drop
+#   - canonical_responseid_final: fill only if decision == override
+#   - drop_reason, notes
+###############################################################################
+
+# ---------------------------------------------------------------------------
+# 0) Pick working datasets with safe fallbacks
+# ---------------------------------------------------------------------------
+stopifnot(exists("ic_ledger_working"))
+
+demo_D   <- if (exists("demo_working2")) demo_working2 else if (exists("demo_working")) demo_working else if (exists("demo_B")) demo_B else demo_raw_wave0
+survey_D <- if (exists("survey_working2")) survey_working2 else if (exists("survey_working")) survey_working else if (exists("survey_B")) survey_B else survey_wave0
+
+# Normalize ppn vectors for presence checks
+demo_ppn_vec   <- unique(trimws(as.character(demo_D$ppn)))
+survey_ppn_vec <- unique(trimws(as.character(survey_D$ppn)))
+
+# ---------------------------------------------------------------------------
+# 1) Build ic_presence table: one row per IC ResponseId candidate
+# ---------------------------------------------------------------------------
+# Expected columns in ic_ledger_working from Step A:
+#   Name_clean, Name_title, ResponseId, flag_test_by_date, flag_test_by_name, StartDate_posix
+stopifnot(all(c("Name_clean", "Name_title", "ResponseId") %in% names(ic_ledger_working)))
+
+# If StartDate_posix is missing for some reason, reconstruct it
+if (!("StartDate_posix" %in% names(ic_ledger_working))) {
+  ic_ledger_working <- ic_ledger_working %>%
+    dplyr::mutate(StartDate_posix = parse_dt_any(StartDate))
+}
+
+ic_presence <- ic_ledger_working %>%
+  dplyr::distinct(Name_clean, Name_title, ResponseId, flag_test_by_date, flag_test_by_name, StartDate_posix) %>%
+  dplyr::mutate(
+    ResponseId = trimws(as.character(ResponseId)),
+    in_demo    = ResponseId %in% demo_ppn_vec,
+    in_survey  = ResponseId %in% survey_ppn_vec
+  ) %>%
+  dplyr::mutate(
+    # Wave 0 downstream scoring:
+    # demo + survey are the only evidence available.
+    downstream_score =
+      (in_demo   * 3L) +   # treat demo as strong evidence
+      (in_survey * 3L)     # treat survey as strong evidence
+  )
+
+# ---------------------------------------------------------------------------
+# 2) Rank candidate ResponseIds within each Name_clean cluster
+# ---------------------------------------------------------------------------
+# Tie-break: higher downstream_score wins; then earlier IC start (conservative),
+# then stable ordering by ResponseId.
+ic_ranked <- ic_presence %>%
+  dplyr::group_by(Name_clean) %>%
+  dplyr::arrange(
+    dplyr::desc(downstream_score),
+    StartDate_posix,
+    ResponseId,
+    .by_group = TRUE
+  ) %>%
+  dplyr::mutate(
+    n_ic_rows_for_name = dplyr::n(),
+    canonical_responseid_auto = dplyr::first(ResponseId),
+    canonical_score_auto      = downstream_score[match(canonical_responseid_auto, ResponseId)],
+    is_canonical_auto = ResponseId == canonical_responseid_auto
+  ) %>%
+  dplyr::ungroup()
+
+# ---------------------------------------------------------------------------
+# 3) One row per identity ledger: full record (read only)
+# ---------------------------------------------------------------------------
+identity_ledger <- ic_ranked %>%
+  dplyr::group_by(Name_clean) %>%
+  dplyr::summarise(
+    Name_title = dplyr::first(stats::na.omit(Name_title)),
+    n_ic_rows  = dplyr::first(n_ic_rows_for_name),
+
+    canonical_responseid_auto = dplyr::first(canonical_responseid_auto),
+    canonical_score_auto      = dplyr::first(canonical_score_auto),
+
+    max_score = suppressWarnings(max(downstream_score, na.rm = TRUE)),
+    n_at_max  = suppressWarnings(sum(downstream_score == max_score, na.rm = TRUE)),
+
+    ic_start_min = suppressWarnings(min(StartDate_posix, na.rm = TRUE)),
+    ic_start_max = suppressWarnings(max(StartDate_posix, na.rm = TRUE)),
+
+    any_test_flags = any(flag_test_by_date | flag_test_by_name, na.rm = TRUE),
+
+    n_candidates_in_demo   = sum(in_demo, na.rm = TRUE),
+    n_candidates_in_survey = sum(in_survey, na.rm = TRUE),
+
+    all_responseids = paste(ResponseId, collapse = " | "),
+    scores_by_responseid = paste0(ResponseId, ":", downstream_score) %>% paste(collapse = " | "),
+    demo_by_responseid    = paste0(ResponseId, ":", as.integer(in_demo))   %>% paste(collapse = " | "),
+    survey_by_responseid  = paste0(ResponseId, ":", as.integer(in_survey)) %>% paste(collapse = " | "),
+
+    reason_summary = dplyr::case_when(
+      n_ic_rows == 1 ~ "single_ic_row",
+      n_ic_rows > 1 & any(downstream_score > 0, na.rm = TRUE) ~ "multiple_ic_rows_pick_best_downstream",
+      n_ic_rows > 1 ~ "multiple_ic_rows_no_downstream_signal",
+      TRUE ~ "unknown"
+    ),
+
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    ic_start_min = dplyr::if_else(is.infinite(ic_start_min), as.POSIXct(NA, tz = "UTC"), ic_start_min),
+    ic_start_max = dplyr::if_else(is.infinite(ic_start_max), as.POSIXct(NA, tz = "UTC"), ic_start_max),
+
+    flag_restart    = n_ic_rows > 1,
+    flag_tie_at_max = flag_restart & n_at_max > 1,
+    flag_low_signal = canonical_score_auto == 0,
+
+    # Wave 0 auto_ok threshold:
+    # max score possible is 6 (demo 3 + survey 3). Treat 6 as "high confidence".
+    auto_ok = canonical_score_auto >= 6 & !flag_tie_at_max & !any_test_flags,
+
+    review_priority = dplyr::case_when(
+      any_test_flags ~ "review_high_test",
+      flag_tie_at_max ~ "review_high_tie",
+      canonical_score_auto == 0 ~ "review_high_no_signal",
+      canonical_score_auto < 6 ~ "review_medium_low_score",
+      TRUE ~ "auto_ok"
+    )
+  ) %>%
+  dplyr::arrange(review_priority, Name_title)
+
+write_audit_csv(identity_ledger, "D_identity_ledger.csv")
+
+# ---------------------------------------------------------------------------
+# 4) Restart-only review queue: editable, only cases needing review
+# ---------------------------------------------------------------------------
+identity_review_queue_template <- identity_ledger %>%
+  dplyr::filter(
+    flag_restart == TRUE,
+    review_priority != "auto_ok"
+  ) %>%
+  dplyr::transmute(
+    Name_title,
+    Name_clean,
+
+    n_ic_rows,
+    canonical_responseid_auto,
+    canonical_score_auto,
+    max_score,
+    n_at_max,
+
+    ic_start_min,
+    ic_start_max,
+
+    n_candidates_in_demo,
+    n_candidates_in_survey,
+
+    all_responseids,
+    scores_by_responseid,
+    demo_by_responseid,
+    survey_by_responseid,
+
+    any_test_flags,
+    reason_summary,
+    flag_tie_at_max,
+    flag_low_signal,
+    review_priority,
+
+    decision = "accept",
+    canonical_responseid_final = "",
+    drop_reason = "",
+    notes = ""
+  )
+
+write_review_csv(identity_review_queue_template, "D_identity_review_queue.csv")
+
+# ---------------------------------------------------------------------------
+# 5) Re-import decisions and apply to produce identity_roster
+# ---------------------------------------------------------------------------
+identity_review_queue <- read_audit_csv2("D_identity_review_queue.csv")
+
+# Safety checks: reviewer should not reorder or delete rows
+stopifnot(nrow(identity_review_queue) == nrow(identity_review_queue_template))
+stopifnot(all(identity_review_queue$Name_clean == identity_review_queue_template$Name_clean))
+stopifnot(all(identity_review_queue$canonical_responseid_auto == identity_review_queue_template$canonical_responseid_auto))
+
+identity_roster <- identity_ledger %>%
+  dplyr::left_join(
+    identity_review_queue %>%
+      dplyr::select(Name_clean, decision, canonical_responseid_final, drop_reason, notes),
+    by = "Name_clean"
+  ) %>%
+  dplyr::mutate(
+    decision = dplyr::if_else(is.na(decision) | decision == "", "accept", as.character(decision)),
+
+    canonical_responseid_final = dplyr::case_when(
+      decision == "override" &
+        !is.na(canonical_responseid_final) &
+        canonical_responseid_final != "" ~ as.character(canonical_responseid_final),
+
+      decision == "accept" ~ as.character(canonical_responseid_auto),
+
+      decision == "drop" ~ NA_character_,
+
+      TRUE ~ as.character(canonical_responseid_auto)
+    ),
+
+    override_is_valid = dplyr::if_else(
+      decision == "override" &
+        !is.na(canonical_responseid_final) &
+        canonical_responseid_final != "",
+      stringr::str_detect(all_responseids, stringr::fixed(canonical_responseid_final)),
+      TRUE
+    )
+  )
+
+stopifnot(all(identity_roster$override_is_valid))
+
+# Receipt: only rows where reviewer changed something
+identity_review_applied <- identity_roster %>%
+  dplyr::filter(decision %in% c("override", "drop")) %>%
+  dplyr::select(
+    Name_title, Name_clean,
+    decision,
+    canonical_responseid_auto, canonical_score_auto,
+    canonical_responseid_final,
+    drop_reason, notes,
+    n_ic_rows, all_responseids, scores_by_responseid,
+    review_priority, flag_tie_at_max, flag_low_signal, any_test_flags
+  )
+
+if (exists("write_receipt_csv")) {
+  write_receipt_csv(identity_review_applied, "D_identity_review_applied.csv")
+} else {
+  write_audit_csv(identity_review_applied, "D_identity_review_applied.csv")
+}
+
+###############################################################################
+# End result:
+#   identity_roster contains canonical_responseid_final (IC ResponseId as ppn)
+#   Use this in later steps to enforce canonical ppns across demo/survey.
+###############################################################################
+
+```
+
+
+
+```{r}
+###############################################################################
+# AUDIT STEP E (Wave 0): incompletes (canonical_score_auto < 6) + optional exclusion
+###############################################################################
+# Output strategy:
+#   - One audit file (editable, in audit_dir):
+#       E_incompletes_review.csv
+#   - One receipt file (read-only, in receipts_dir):
+#       E_incompletes_receipt.csv
+#
+# Rules:
+#   - The audit file contains ONLY incompletes (canonical_score_auto < 6)
+#   - IC-only identities are default keep = FALSE
+#   - Any identity with any downstream rows defaults keep = TRUE
+#   - If any are dropped, rebuild identity_ledger and identity_roster in place
+###############################################################################
+
+stopifnot(exists("identity_ledger"))
+stopifnot(exists("identity_roster"))
+stopifnot(exists("ic_ledger_working"))
+stopifnot(exists("write_audit_csv"))
+stopifnot(exists("write_receipt_csv"))
+
+# ---------------------------------------------------------------------------
+# 0) Choose most current working datasets
+# ---------------------------------------------------------------------------
+demo_E   <- if (exists("demo_working2")) demo_working2 else if (exists("demo_working")) demo_working else if (exists("demo_B")) demo_B else demo_raw_wave0
+survey_E <- if (exists("survey_working2")) survey_working2 else if (exists("survey_working")) survey_working else if (exists("survey_B")) survey_B else survey_wave0
+
+demo_E   <- demo_E   %>% dplyr::mutate(ppn = trimws(as.character(ppn)))
+survey_E <- survey_E %>% dplyr::mutate(ppn = trimws(as.character(ppn)))
+
+# ---------------------------------------------------------------------------
+# 1) Stage summary helper (rows, progress, finished, status) by ppn
+# ---------------------------------------------------------------------------
+summarise_stage_by_ppn <- function(df, stage_prefix) {
+  if (is.null(df) || nrow(df) == 0) {
+    return(tibble::tibble(
+      canonical_ppn = character(),
+      !!paste0(stage_prefix, "_n_rows") := integer(),
+      !!paste0(stage_prefix, "_progress_max") := numeric(),
+      !!paste0(stage_prefix, "_finished_any") := logical(),
+      !!paste0(stage_prefix, "_status") := character()
+    ))
+  }
+
+  df <- df %>% dplyr::mutate(ppn = trimws(as.character(ppn)))
+
+  has_progress <- "Progress" %in% names(df)
+  has_finished <- "Finished" %in% names(df)
+
+  df %>%
+    dplyr::filter(!is.na(ppn) & ppn != "") %>%
+    dplyr::group_by(ppn) %>%
+    dplyr::summarise(
+      n_rows = dplyr::n(),
+      progress_max = if (has_progress) suppressWarnings(max(as.numeric(Progress), na.rm = TRUE)) else NA_real_,
+      finished_any = if (has_finished) any(suppressWarnings(as.numeric(Finished)) == 1, na.rm = TRUE) else NA,
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      stage_status = dplyr::case_when(
+        n_rows == 0 ~ "missing",
+        !is.na(finished_any) & finished_any ~ "complete",
+        !is.na(progress_max) & progress_max >= 100 ~ "complete",
+        TRUE ~ "partial"
+      )
+    ) %>%
+    dplyr::transmute(
+      canonical_ppn = ppn,
+      !!paste0(stage_prefix, "_n_rows") := as.integer(n_rows),
+      !!paste0(stage_prefix, "_progress_max") := as.numeric(progress_max),
+      !!paste0(stage_prefix, "_finished_any") := as.logical(finished_any),
+      !!paste0(stage_prefix, "_status") := as.character(stage_status)
+    )
+}
+
+# IC stage: ResponseId is canonical ppn
+ic_stage <- ic_ledger_working %>%
+  dplyr::mutate(ResponseId = trimws(as.character(ResponseId))) %>%
+  dplyr::filter(!is.na(ResponseId) & ResponseId != "") %>%
+  dplyr::group_by(ResponseId) %>%
+  dplyr::summarise(ic_n_rows = dplyr::n(), .groups = "drop") %>%
+  dplyr::transmute(
+    canonical_ppn = ResponseId,
+    ic_n_rows = as.integer(ic_n_rows),
+    ic_progress_max = as.numeric(NA),
+    ic_finished_any = as.logical(NA),
+    ic_status = "present"
+  )
+
+demo_stage   <- summarise_stage_by_ppn(demo_E,   "demo")
+survey_stage <- summarise_stage_by_ppn(survey_E, "survey")
+
+stage_summary <- ic_stage %>%
+  dplyr::full_join(demo_stage,   by = "canonical_ppn") %>%
+  dplyr::full_join(survey_stage, by = "canonical_ppn") %>%
+  dplyr::mutate(
+    ic_n_rows      = ifelse(is.na(ic_n_rows), 0L, ic_n_rows),
+    demo_n_rows    = ifelse(is.na(demo_n_rows), 0L, demo_n_rows),
+    survey_n_rows  = ifelse(is.na(survey_n_rows), 0L, survey_n_rows),
+
+    ic_status      = ifelse(is.na(ic_status) & ic_n_rows > 0, "present", ic_status),
+    demo_status    = ifelse(is.na(demo_status)   & demo_n_rows   > 0, "partial", demo_status),
+    survey_status  = ifelse(is.na(survey_status) & survey_n_rows > 0, "partial", survey_status),
+
+    ic_status      = ifelse(is.na(ic_status), "missing", ic_status),
+    demo_status    = ifelse(is.na(demo_status), "missing", demo_status),
+    survey_status  = ifelse(is.na(survey_status), "missing", survey_status)
+  )
+
+# ---------------------------------------------------------------------------
+# 2) Build ONE review table (ONLY canonical_score_auto < 6)
+#    Use roster canonical_responseid_final as canonical ppn per identity.
+# ---------------------------------------------------------------------------
+roster_ppn <- identity_roster %>%
+  dplyr::mutate(
+    decision = ifelse(is.na(decision) | decision == "", "accept", as.character(decision)),
+    canonical_responseid_final = trimws(as.character(canonical_responseid_final))
+  ) %>%
+  dplyr::filter(decision != "drop") %>%
+  dplyr::transmute(
+    Name_clean,
+    canonical_ppn = canonical_responseid_final
+  ) %>%
+  dplyr::filter(!is.na(canonical_ppn) & canonical_ppn != "") %>%
+  dplyr::distinct(Name_clean, .keep_all = TRUE)
+
+E_review_template <- identity_ledger %>%
+  dplyr::left_join(roster_ppn, by = "Name_clean") %>%
+  dplyr::filter(!is.na(canonical_ppn) & canonical_ppn != "") %>%
+  dplyr::filter(canonical_score_auto < 6) %>%
+  dplyr::left_join(stage_summary, by = "canonical_ppn") %>%
+  dplyr::mutate(
+    downstream_any_rows = (demo_n_rows + survey_n_rows) > 0L,
+    keep = downstream_any_rows,
+    drop_reason = dplyr::case_when(
+      downstream_any_rows == FALSE ~ "ic_only_no_usable_downstream_data",
+      TRUE ~ ""
+    ),
+    notes = ""
+  ) %>%
+  dplyr::transmute(
+    Name_title,
+    Name_clean,
+    canonical_ppn,
+
+    canonical_score_auto,
+    max_score,
+    review_priority,
+
+    # Wave 0 downstream evidence columns from Step D
+    n_candidates_in_demo,
+    n_candidates_in_survey,
+
+    scores_by_responseid,
+    demo_by_responseid,
+    survey_by_responseid,
+
+    ic_n_rows, ic_status,
+    demo_n_rows, demo_progress_max, demo_finished_any, demo_status,
+    survey_n_rows, survey_progress_max, survey_finished_any, survey_status,
+
+    downstream_any_rows,
+
+    keep, drop_reason, notes
+  ) %>%
+  dplyr::arrange(canonical_score_auto, Name_title)
+
+write_review_csv(E_review_template, "E_incompletes_review.csv")
+
+# ---------------------------------------------------------------------------
+# 3) Read decisions and compute drops
+# ---------------------------------------------------------------------------
+E_review <- read_audit_csv2("E_incompletes_review.csv") %>%
+  dplyr::mutate(
+    Name_clean = as.character(Name_clean),
+    canonical_ppn = trimws(as.character(canonical_ppn)),
+    keep = as.logical(keep),
+    drop_reason = as.character(drop_reason),
+    notes = as.character(notes)
+  )
+
+stopifnot(nrow(E_review) == nrow(E_review_template))
+stopifnot(all(E_review$Name_clean == E_review_template$Name_clean))
+stopifnot(all(E_review$canonical_ppn == E_review_template$canonical_ppn))
+
+drop_ppns_E <- E_review %>%
+  dplyr::filter(keep == FALSE) %>%
+  dplyr::pull(canonical_ppn) %>%
+  unique()
+
+drop_ppns_E <- drop_ppns_E[!is.na(drop_ppns_E) & drop_ppns_E != ""]
+
+# ---------------------------------------------------------------------------
+# 4) Apply drops only if needed, then rebuild identity_ledger and identity_roster
+# ---------------------------------------------------------------------------
+n_drop <- length(drop_ppns_E)
+
+if (n_drop > 0) {
+
+  # Filter working datasets
+  ic_ledger_working <- ic_ledger_working %>%
+    dplyr::mutate(ResponseId = trimws(as.character(ResponseId))) %>%
+    dplyr::filter(!(ResponseId %in% drop_ppns_E))
+
+  demo_E   <- demo_E   %>% dplyr::filter(!(ppn %in% drop_ppns_E))
+  survey_E <- survey_E %>% dplyr::filter(!(ppn %in% drop_ppns_E))
+
+  # Recompute presence vectors
+  demo_ppn_vec   <- unique(demo_E$ppn)
+  survey_ppn_vec <- unique(survey_E$ppn)
+
+  # Rebuild ic_presence using Wave 0 scoring
+  ic_presence <- ic_ledger_working %>%
+    dplyr::distinct(Name_clean, Name_title, ResponseId, flag_test_by_date, flag_test_by_name, StartDate_posix) %>%
+    dplyr::mutate(
+      ResponseId = trimws(as.character(ResponseId)),
+      in_demo    = ResponseId %in% demo_ppn_vec,
+      in_survey  = ResponseId %in% survey_ppn_vec
+    ) %>%
+    dplyr::mutate(
+      downstream_score =
+        (in_demo   * 3L) +
+        (in_survey * 3L)
+    )
+
+  ic_ranked <- ic_presence %>%
+    dplyr::group_by(Name_clean) %>%
+    dplyr::arrange(dplyr::desc(downstream_score), StartDate_posix, ResponseId, .by_group = TRUE) %>%
+    dplyr::mutate(
+      n_ic_rows_for_name = dplyr::n(),
+      canonical_responseid_auto = dplyr::first(ResponseId),
+      canonical_score_auto = downstream_score[match(canonical_responseid_auto, ResponseId)],
+      is_canonical_auto = ResponseId == canonical_responseid_auto
+    ) %>%
+    dplyr::ungroup()
+
+  identity_ledger <- ic_ranked %>%
+    dplyr::group_by(Name_clean) %>%
+    dplyr::summarise(
+      Name_title = dplyr::first(stats::na.omit(Name_title)),
+      n_ic_rows  = dplyr::first(n_ic_rows_for_name),
+
+      canonical_responseid_auto = dplyr::first(canonical_responseid_auto),
+      canonical_score_auto      = dplyr::first(canonical_score_auto),
+
+      max_score = suppressWarnings(max(downstream_score, na.rm = TRUE)),
+      n_at_max  = suppressWarnings(sum(downstream_score == max_score, na.rm = TRUE)),
+
+      ic_start_min = suppressWarnings(min(StartDate_posix, na.rm = TRUE)),
+      ic_start_max = suppressWarnings(max(StartDate_posix, na.rm = TRUE)),
+
+      any_test_flags = any(flag_test_by_date | flag_test_by_name, na.rm = TRUE),
+
+      n_candidates_in_demo   = sum(in_demo, na.rm = TRUE),
+      n_candidates_in_survey = sum(in_survey, na.rm = TRUE),
+
+      all_responseids = paste(ResponseId, collapse = " | "),
+      scores_by_responseid = paste0(ResponseId, ":", downstream_score) %>% paste(collapse = " | "),
+      demo_by_responseid    = paste0(ResponseId, ":", as.integer(in_demo))   %>% paste(collapse = " | "),
+      survey_by_responseid  = paste0(ResponseId, ":", as.integer(in_survey)) %>% paste(collapse = " | "),
+
+      reason_summary = dplyr::case_when(
+        n_ic_rows == 1 ~ "single_ic_row",
+        n_ic_rows > 1 & any(downstream_score > 0, na.rm = TRUE) ~ "multiple_ic_rows_pick_best_downstream",
+        n_ic_rows > 1 ~ "multiple_ic_rows_no_downstream_signal",
+        TRUE ~ "unknown"
+      ),
+
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      ic_start_min = dplyr::if_else(is.infinite(ic_start_min), as.POSIXct(NA, tz = "UTC"), ic_start_min),
+      ic_start_max = dplyr::if_else(is.infinite(ic_start_max), as.POSIXct(NA, tz = "UTC"), ic_start_max),
+
+      flag_restart    = n_ic_rows > 1,
+      flag_tie_at_max = flag_restart & n_at_max > 1,
+      flag_low_signal = canonical_score_auto == 0,
+
+      auto_ok = canonical_score_auto >= 6 & !flag_tie_at_max & !any_test_flags,
+
+      review_priority = dplyr::case_when(
+        any_test_flags ~ "review_high_test",
+        flag_tie_at_max ~ "review_high_tie",
+        canonical_score_auto == 0 ~ "review_high_no_signal",
+        canonical_score_auto < 6 ~ "review_medium_low_score",
+        TRUE ~ "auto_ok"
+      )
+    ) %>%
+    dplyr::arrange(review_priority, Name_title)
+
+  # Preserve any existing manual restarter decisions already in identity_roster
+  manual_decisions <- identity_roster %>%
+    dplyr::transmute(
+      Name_clean,
+      decision_manual = as.character(decision),
+      canonical_responseid_final_manual = as.character(canonical_responseid_final),
+      drop_reason_manual = as.character(drop_reason),
+      notes_manual = as.character(notes)
+    )
+
+  identity_roster <- identity_ledger %>%
+    dplyr::left_join(manual_decisions, by = "Name_clean") %>%
+    dplyr::mutate(
+      decision = ifelse(!is.na(decision_manual) & decision_manual != "", decision_manual, "accept"),
+      canonical_responseid_final = dplyr::case_when(
+        decision == "override" &
+          !is.na(canonical_responseid_final_manual) &
+          canonical_responseid_final_manual != "" ~ canonical_responseid_final_manual,
+        decision == "drop" ~ NA_character_,
+        TRUE ~ canonical_responseid_auto
+      ),
+      drop_reason = ifelse(!is.na(drop_reason_manual) & drop_reason_manual != "", drop_reason_manual, ""),
+      notes = ifelse(!is.na(notes_manual) & notes_manual != "", notes_manual, "")
+    ) %>%
+    dplyr::select(-dplyr::ends_with("_manual"))
+
+  identity_roster <- identity_roster %>%
+    dplyr::mutate(
+      override_is_valid = dplyr::if_else(
+        decision == "override" & !is.na(canonical_responseid_final) & canonical_responseid_final != "",
+        stringr::str_detect(all_responseids, stringr::fixed(canonical_responseid_final)),
+        TRUE
+      )
+    )
+  stopifnot(all(identity_roster$override_is_valid))
+}
+
+# ---------------------------------------------------------------------------
+# 5) Single receipt (always) -> receipts_dir
+# ---------------------------------------------------------------------------
+E_receipt <- tibble::tibble(
+  n_incompletes_in_review = nrow(E_review_template),
+  n_marked_drop = n_drop,
+  n_marked_keep = nrow(E_review_template) - n_drop
+)
+
+write_receipt_csv(E_receipt, "E_incompletes_receipt.csv")
+
+```
+
+
+
+```{r}
+###############################################################################
+# AUDIT STEP F (Wave 0): LINKAGE (Name Matching) AND gutsID PROPAGATION
+###############################################################################
+# Goal:
+#   Attach the consortium identifier (gutsID) to each participant and propagate
+#   it across Wave 0 components.
+#
+# Why IC is the anchor:
+#   Linkage maps participant names -> gutsID.
+#   IC is the only place with participant names tied to the canonical ResponseId
+#   (which functions as ppn downstream).
+#
+# Strategy:
+#   1) Standardize names in both linkage and IC into a stable join key
+#   2) Apply optional private IC name corrections before linkage matching
+#   3) Join IC -> linkage to assign gutsID
+#   4) Build a ppn -> gutsID map from IC ResponseId
+#   5) Propagate gutsID to demo / survey using ppn
+#
+# Outputs:
+#   - One audit review file:
+#       F_linkage_review.csv
+#   - One receipt file (written to receipts_dir):
+#       F_linkage_receipt.csv
+###############################################################################
+
+stopifnot(exists("linkage"))
+stopifnot(exists("clean_name"))
+stopifnot(exists("fix_tussenvoegsels"))
+
+# ------------------------------------------------------------
+# 0) Select the most current working datasets
+# ------------------------------------------------------------
+ic_src <- if (exists("ic_ledger_working")) {
+  ic_ledger_working
+} else if (exists("ic_combined_working")) {
+  ic_combined_working
+} else {
+  ic_combined
+}
+stopifnot(!is.null(ic_src))
+
+demo_src <- if (exists("demo_working2")) {
+  demo_working2
+} else if (exists("demo_working")) {
+  demo_working
+} else {
+  demo_raw_wave0
+}
+
+survey_src <- if (exists("survey_working2")) {
+  survey_working2
+} else if (exists("survey_working")) {
+  survey_working
+} else {
+  survey_wave0
+}
+
+demo_src <- demo_src %>%
+  dplyr::mutate(ppn = trimws(as.character(ppn)))
+
+survey_src <- survey_src %>%
+  dplyr::mutate(ppn = trimws(as.character(ppn)))
+
+# ------------------------------------------------------------
+# 1) Stable title key helper
+# ------------------------------------------------------------
+make_title_key <- function(x) {
+  x %>%
+    as.character() %>%
+    stringr::str_squish() %>%
+    stringi::stri_trans_nfc() %>%
+    stringr::str_to_title() %>%
+    fix_tussenvoegsels()
+}
+
+# ------------------------------------------------------------
+# 2) Build clean IC name field and apply optional private corrections
+# ------------------------------------------------------------
+# Participant-specific name corrections must not be hard-coded in a public
+# repository. If needed, define linkage_name_patches in the private config as
+# a named character vector: names = survey-side names; values = corrected names.
+
+if (!exists("linkage_name_patches", inherits = FALSE)) {
+  linkage_name_patches <- character(0)
+}
+
+ic_fixed <- ic_src %>%
+  dplyr::mutate(
+    ResponseId = trimws(as.character(ResponseId)),
+    Name_title = dplyr::coalesce(
+      if ("Name_title" %in% names(.)) as.character(Name_title) else NA_character_,
+      if ("Name" %in% names(.)) as.character(Name) else NA_character_,
+      if ("ic_name" %in% names(.)) as.character(ic_name) else NA_character_
+    ),
+    Name_title = make_title_key(Name_title),
+    Name_title_original = Name_title,
+    Name_title = ifelse(
+      Name_title %in% names(linkage_name_patches),
+      unname(linkage_name_patches[Name_title]),
+      Name_title
+    ),
+    Name_title = make_title_key(Name_title),
+    Name_title_key = clean_name(Name_title),
+    hardcode_applied = Name_title != Name_title_original
+  )
+
+# ------------------------------------------------------------
+# 3) Build stable linkage key
+# ------------------------------------------------------------
+linkage_name_col <- dplyr::case_when(
+  "Name" %in% names(linkage) ~ "Name",
+  "name" %in% names(linkage) ~ "name",
+  TRUE ~ NA_character_
+)
+
+linkage_id_col <- dplyr::case_when(
+  "ID" %in% names(linkage) ~ "ID",
+  "gutsID" %in% names(linkage) ~ "gutsID",
+  "GUTSID" %in% names(linkage) ~ "GUTSID",
+  TRUE ~ NA_character_
+)
+
+stopifnot(!is.na(linkage_name_col))
+stopifnot(!is.na(linkage_id_col))
+
+linkage_key <- linkage %>%
+  dplyr::mutate(
+    Name_raw = as.character(.data[[linkage_name_col]]),
+    gutsID = as.character(.data[[linkage_id_col]]),
+    Name_title = make_title_key(Name_raw),
+    Name_title_key = clean_name(Name_title)
+  ) %>%
+  dplyr::select(gutsID, Name_raw, Name_title, Name_title_key) %>%
+  dplyr::distinct()
+
+# ------------------------------------------------------------
+# 4) Join IC -> linkage to assign gutsID
+# ------------------------------------------------------------
+ic_linked <- ic_fixed %>%
+  dplyr::left_join(
+    linkage_key %>%
+      dplyr::select(gutsID, linkage_Name_title = Name_title, Name_title_key),
+    by = "Name_title_key"
+  )
+
+# ------------------------------------------------------------
+# 5) Audit checks
+# ------------------------------------------------------------
+
+# A) Which hard-coded names were applied, and did they now match linkage?
+hardcode_status <- ic_linked %>%
+  dplyr::filter(hardcode_applied) %>%
+  dplyr::transmute(
+    issue_type = dplyr::case_when(
+      is.na(gutsID) | gutsID == "" ~ "hardcode_applied_still_unmatched",
+      TRUE ~ "hardcode_applied_matched"
+    ),
+    Name_title_original,
+    Name_title,
+    Name_title_key,
+    ResponseId,
+    gutsID,
+    details = dplyr::case_when(
+      is.na(gutsID) | gutsID == "" ~ "hardcode applied but still no linkage match",
+      TRUE ~ paste0("matched linkage name: ", linkage_Name_title)
+    )
+  )
+
+# B) IC names that still do not exist in linkage
+ic_unmatched <- ic_linked %>%
+  dplyr::filter(is.na(gutsID) | gutsID == "") %>%
+  dplyr::transmute(
+    issue_type = "ic_name_missing_in_linkage",
+    Name_title_original,
+    Name_title,
+    Name_title_key,
+    ResponseId,
+    gutsID = NA_character_,
+    details = dplyr::case_when(
+      hardcode_applied ~ "hardcode applied but still unmatched",
+      TRUE ~ "no hardcode applied"
+    )
+  )
+
+# C) Linkage duplicate keys
+linkage_dupes <- linkage_key %>%
+  dplyr::count(Name_title_key, Name_title, sort = TRUE) %>%
+  dplyr::filter(n > 1) %>%
+  dplyr::transmute(
+    issue_type = "linkage_duplicate_name_key",
+    Name_title_original = NA_character_,
+    Name_title,
+    Name_title_key,
+    ResponseId = NA_character_,
+    gutsID = NA_character_,
+    details = paste0("n_rows=", n)
+  )
+
+# D) ResponseIds mapping to multiple gutsIDs
+ppn_gutsid_conflicts <- ic_linked %>%
+  dplyr::filter(!is.na(ResponseId) & ResponseId != "") %>%
+  dplyr::group_by(ResponseId) %>%
+  dplyr::summarise(
+    n_gutsIDs = dplyr::n_distinct(gutsID, na.rm = TRUE),
+    gutsIDs = paste(sort(unique(stats::na.omit(gutsID))), collapse = " | "),
+    .groups = "drop"
+  ) %>%
+  dplyr::filter(n_gutsIDs > 1) %>%
+  dplyr::transmute(
+    issue_type = "responseid_maps_to_multiple_gutsid",
+    Name_title_original = NA_character_,
+    Name_title = NA_character_,
+    Name_title_key = NA_character_,
+    ResponseId,
+    gutsID = NA_character_,
+    details = paste0("gutsIDs=", gutsIDs)
+  )
+
+F_review <- dplyr::bind_rows(
+  hardcode_status,
+  ic_unmatched,
+  linkage_dupes,
+  ppn_gutsid_conflicts
+)
+
+write_audit_csv(F_review, "F_linkage_review.csv")
+
+# ------------------------------------------------------------
+# 6) Build deterministic ppn -> gutsID map
+# ------------------------------------------------------------
+ppn_to_gutsid <- ic_linked %>%
+  dplyr::filter(!is.na(ResponseId) & ResponseId != "") %>%
+  dplyr::group_by(ResponseId) %>%
+  dplyr::summarise(
+    gutsID = {
+      vals <- sort(unique(stats::na.omit(gutsID)))
+      if (length(vals) == 0) NA_character_ else vals[1]
+    },
+    .groups = "drop"
+  ) %>%
+  dplyr::rename(ppn = ResponseId)
+
+# ------------------------------------------------------------
+# 7) Propagate gutsID to Wave 0 downstream datasets
+# ------------------------------------------------------------
+add_gutsid <- function(df, map_tbl) {
+  df %>%
+    dplyr::mutate(ppn = trimws(as.character(ppn))) %>%
+    dplyr::left_join(map_tbl, by = "ppn")
+}
+
+demo_linked <- add_gutsid(demo_src, ppn_to_gutsid)
+survey_linked <- add_gutsid(survey_src, ppn_to_gutsid)
+
+# ------------------------------------------------------------
+# 8) Final outputs
+# ------------------------------------------------------------
+ic_ledger_final <- ic_linked
+demo_final <- demo_linked
+survey_final <- survey_linked
+
+move_gutsid_first <- function(df) {
+  if (!"gutsID" %in% names(df)) return(df)
+  df %>% dplyr::select(gutsID, dplyr::everything())
+}
+
+ic_ledger_final <- move_gutsid_first(ic_ledger_final)
+demo_final <- move_gutsid_first(demo_final)
+survey_final <- move_gutsid_first(survey_final)
+
+# ------------------------------------------------------------
+# 9) Receipt summary
+# ------------------------------------------------------------
+F_receipt <- tibble::tibble(
+  n_ic_rows = nrow(ic_ledger_final),
+  n_demo_rows = nrow(demo_final),
+  n_survey_rows = nrow(survey_final),
+
+  n_ic_with_gutsID = sum(!is.na(ic_ledger_final$gutsID) & ic_ledger_final$gutsID != "", na.rm = TRUE),
+  n_demo_with_gutsID = sum(!is.na(demo_final$gutsID) & demo_final$gutsID != "", na.rm = TRUE),
+  n_survey_with_gutsID = sum(!is.na(survey_final$gutsID) & survey_final$gutsID != "", na.rm = TRUE),
+
+  n_audit_issues = nrow(F_review),
+  n_hardcode_applied = sum(ic_fixed$hardcode_applied, na.rm = TRUE),
+  n_hardcode_applied_matched = sum(F_review$issue_type == "hardcode_applied_matched", na.rm = TRUE),
+  n_hardcode_applied_still_unmatched = sum(F_review$issue_type == "hardcode_applied_still_unmatched", na.rm = TRUE),
+  n_ic_unmatched_names = nrow(ic_unmatched),
+  n_linkage_duplicate_keys = nrow(linkage_dupes),
+  n_ppn_conflicts = nrow(ppn_gutsid_conflicts)
+)
+
+write_receipt_csv(F_receipt, "F_linkage_receipt.csv")
+
+message("Audit Step F (Wave 0) complete: gutsID linked and propagated.")
+
+```
+
+
+
+```{r}
+###############################################################################
+# CHUNK 1) MEASURE OVERVIEW MANIFEST (T0) -> LOCKED REGISTRIES
+#
+# Purpose
+#   Read the T0 behavioral overview file (ordered to match Qualtrics), clean it,
+#   validate only the minimum requirements needed for downstream steps, and then
+#   produce TWO canonical registries:
+#
+#     1) registry_items    (item-level; one row per overview row)
+#     2) registry_measures (measure-level; one row per short_name x component)
+#
+# Philosophy
+#   Treat the overview as the authoritative source of truth. We therefore avoid
+#   enforcing "descriptor consistency" checks that can legitimately vary by item
+#   (e.g., references, subscales).
+#
+# Wave 0 notes
+#   - T0 is shorter than later waves
+#   - T0 has no sociometrics
+#   - Expected components are: sensitive, questionnaire
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(janitor)
+  library(dplyr)
+  library(stringr)
+  library(tidyr)
+  library(purrr)
+})
+
+# --------------------------------------------------------------------------
+# STEP X.1) IMPORT OVERVIEW (T0)
+# --------------------------------------------------------------------------
+
+overview_path <- file.path(dir0, "Behavioral/T0/T0_behavioral_overview.xlsx")
+
+if (!file.exists(overview_path)) {
+  stop("T0_behavioral_overview.xlsx not found.")
+}
+
+overview_raw <- readxl::read_excel(
+  path = overview_path,
+  sheet = 1,
+  .name_repair = "minimal"
+)
+
+overview <- overview_raw %>%
+  janitor::clean_names() %>%
+  dplyr::mutate(
+    dplyr::across(
+      .cols = where(is.character),
+      .fns  = ~ stringr::str_squish(.x)
+    )
+  )
+
+message("Overview rows: ", nrow(overview))
+message("Overview columns: ", ncol(overview))
+
+# --------------------------------------------------------------------------
+# STEP X.2) CLEAN OVERVIEW (LOCKED)
+# --------------------------------------------------------------------------
+
+# Drop obvious Excel artifacts if present
+overview <- overview %>%
+  dplyr::select(-dplyr::any_of(c("b", "x", "unnamed_2")))
+
+# Harmonize Wave 0 column names to the same registry conventions used later
+overview <- overview %>%
+  dplyr::rename(
+    short_name = short_name,
+    variable_name = variable_name,
+    variable_label = variable_label,
+    variable_values = variable_values,
+    variable_values_label = variable_values_label,
+    original_english_or_dutch = original_english_or_dutch,
+    english_translation = english_translation,
+    original_dutch = original_dutch,
+    references = references,
+    amount_of_items_in_original_questionnaire = amount_of_items_in_original_questionnaire,
+    amount_of_items_in_guts_questionnaire = amount_of_items_in_guts_questionnaire
+  )
+
+# Wave 0 uses a different reversed-items column name than T1
+if ("reversed_items_0_no_1_yes" %in% names(overview)) {
+  overview <- overview %>%
+    dplyr::rename(reversed_items = reversed_items_0_no_1_yes)
+}
+
+# Fill down implied continuity for key columns
+fill_cols <- c(
+  "short_name",
+  "component",
+  "questionnaire",
+  "subscales",
+  "original_english_or_dutch",
+  "back_translation_if_necessary_by",
+  "references",
+  "amount_of_items_in_original_questionnaire",
+  "amount_of_items_in_guts_questionnaire"
+)
+
+overview <- overview %>%
+  tidyr::fill(dplyr::any_of(fill_cols), .direction = "down")
+
+# String hygiene for key columns
+overview <- overview %>%
+  dplyr::mutate(
+    dplyr::across(
+      .cols = dplyr::any_of(c("short_name", "component", "variable_name")),
+      .fns  = ~ stringr::str_squish(.x)
+    ),
+    component = dplyr::if_else(is.na(component), NA_character_, tolower(component))
+  )
+
+# Coerce flags / counts into stable types
+overview <- overview %>%
+  dplyr::mutate(
+    reversed_items = suppressWarnings(as.integer(reversed_items)),
+    amount_of_items_in_original_questionnaire =
+      suppressWarnings(as.integer(amount_of_items_in_original_questionnaire)),
+    amount_of_items_in_guts_questionnaire =
+      suppressWarnings(as.integer(amount_of_items_in_guts_questionnaire))
+  )
+
+# --------------------------------------------------------------------------
+# STEP X.3) MINIMUM VALIDATIONS (FAIL FAST ONLY WHEN NECESSARY)
+# --------------------------------------------------------------------------
+
+required_cols <- c("short_name", "component", "variable_name")
+missing_required <- setdiff(required_cols, names(overview))
+if (length(missing_required) > 0) {
+  stop("Overview is missing required columns: ", paste(missing_required, collapse = ", "))
+}
+
+bad_short <- which(is.na(overview$short_name) | overview$short_name == "")
+bad_comp  <- which(is.na(overview$component)  | overview$component  == "")
+bad_var   <- which(is.na(overview$variable_name) | overview$variable_name == "")
+
+if (length(bad_short) > 0) stop("Overview has missing short_name in row(s): ", paste(head(bad_short, 20), collapse = ", "))
+if (length(bad_comp)  > 0) stop("Overview has missing component in row(s): ", paste(head(bad_comp, 20), collapse = ", "))
+if (length(bad_var)   > 0) stop("Overview has missing variable_name in row(s): ", paste(head(bad_var, 20), collapse = ", "))
+
+valid_components <- c("sensitive", "questionnaire")
+unexpected_components <- overview %>%
+  dplyr::distinct(component) %>%
+  dplyr::filter(!component %in% valid_components)
+
+if (nrow(unexpected_components) > 0) {
+  stop(
+    "Overview has unexpected component value(s): ",
+    paste(unexpected_components$component, collapse = ", "),
+    "\nExpected: ", paste(valid_components, collapse = ", ")
+  )
+}
+
+dups_within_measure <- overview %>%
+  dplyr::count(short_name, component, variable_name) %>%
+  dplyr::filter(n > 1)
+
+if (nrow(dups_within_measure) > 0) {
+  print(dups_within_measure, n = 200)
+  stop("Duplicate variable_name(s) detected within short_name x component. See printed table.")
+}
+
+overview_summary <- overview %>%
+  dplyr::count(short_name, component, name = "n_items") %>%
+  dplyr::arrange(short_name, component)
+
+print(overview_summary)
+message(
+  "Manifest locked: ", nrow(overview),
+  " rows across ", dplyr::n_distinct(overview$short_name),
+  " measures."
+)
+
+# --------------------------------------------------------------------------
+# STEP X.4) BUILD REGISTRIES
+# --------------------------------------------------------------------------
+
+parse_numeric_range <- function(x) {
+  x0 <- str_squish(tolower(as.character(x)))
+  if (is.na(x0) || x0 == "") return(list(ok = FALSE, min = NA_real_, max = NA_real_))
+  m <- str_match(x0, "^(\\d+)\\s*to\\s*(\\d+)$")
+  if (all(is.na(m))) return(list(ok = FALSE, min = NA_real_, max = NA_real_))
+  list(ok = TRUE, min = as.numeric(m[2]), max = as.numeric(m[3]))
+}
+
+parse_value_labels <- function(x) {
+  x0 <- as.character(x)
+  if (is.na(x0) || str_squish(x0) == "") return(list(ok = FALSE, levels = NULL, n_levels = 0L))
+
+  parts <- str_split(x0, pattern = "[;\n\r]+", simplify = FALSE)[[1]]
+  parts <- str_squish(parts)
+  parts <- parts[parts != ""]
+
+  m <- str_match(parts, "^\\s*(\\d+)\\s*[:=]\\s*(.+?)\\s*$")
+  if (nrow(m) == 0 || all(is.na(m[, 2]))) return(list(ok = FALSE, levels = NULL, n_levels = 0L))
+
+  ok_idx <- which(!is.na(m[, 2]) & !is.na(m[, 3]))
+  if (length(ok_idx) == 0) return(list(ok = FALSE, levels = NULL, n_levels = 0L))
+
+  keys <- m[ok_idx, 2]
+  vals <- m[ok_idx, 3]
+
+  keep <- !duplicated(keys)
+  keys <- keys[keep]
+  vals <- vals[keep]
+
+  lv <- vals
+  names(lv) <- keys
+
+  list(ok = TRUE, levels = lv, n_levels = length(lv))
+}
+
+registry_items <- overview %>%
+  dplyr::mutate(
+    overview_row = dplyr::row_number(),
+
+    short_name = str_squish(as.character(short_name)),
+    component = tolower(str_squish(as.character(component))),
+    variable_name = str_squish(as.character(variable_name)),
+
+    reversed_flag = suppressWarnings(as.integer(reversed_items)),
+    reversed_flag = dplyr::if_else(is.na(reversed_flag), 0L, reversed_flag),
+
+    is_prefix = str_ends(variable_name, "_"),
+    variable_name_base = str_remove(variable_name, "_$"),
+
+    range_parsed = purrr::map(variable_values, parse_numeric_range),
+    scale_min = purrr::map_dbl(range_parsed, ~ .x$min),
+    scale_max = purrr::map_dbl(range_parsed, ~ .x$max),
+    range_ok = purrr::map_lgl(range_parsed, ~ .x$ok),
+
+    levels_parsed = purrr::map(variable_values_label, parse_value_labels),
+    levels_ok = purrr::map_lgl(levels_parsed, ~ .x$ok),
+    n_levels = purrr::map_int(levels_parsed, ~ .x$n_levels),
+
+    scale_type = dplyr::case_when(
+      range_ok  ~ "numeric_range",
+      levels_ok ~ "categorical_levels",
+      TRUE      ~ "unknown"
+    )
+  ) %>%
+  dplyr::arrange(overview_row)
+
+first_non_empty <- function(x) {
+  x0 <- str_squish(as.character(x))
+  x0 <- x0[!is.na(x0) & x0 != ""]
+  if (length(x0) == 0) NA_character_ else x0[1]
+}
+
+first_non_na_int <- function(x) {
+  x0 <- suppressWarnings(as.integer(x))
+  x0 <- x0[!is.na(x0)]
+  if (length(x0) == 0) NA_integer_ else x0[1]
+}
+
+unique_non_empty <- function(x) {
+  x0 <- str_squish(as.character(x))
+  x0 <- x0[!is.na(x0) & x0 != ""]
+  unique(x0)
+}
+
+registry_measures <- registry_items %>%
+  dplyr::group_by(component, short_name) %>%
+  dplyr::summarise(
+    overview_row_start = min(overview_row),
+    overview_row_end = max(overview_row),
+
+    n_items_manifest = dplyr::n(),
+    variable_names_manifest = list(variable_name),
+
+    questionnaire =
+      if ("questionnaire" %in% names(cur_data())) first_non_empty(questionnaire) else NA_character_,
+    references =
+      if ("references" %in% names(cur_data())) first_non_empty(references) else NA_character_,
+
+    original_english_or_dutch =
+      if ("original_english_or_dutch" %in% names(cur_data())) first_non_empty(original_english_or_dutch) else NA_character_,
+    back_translation_if_necessary_by =
+      if ("back_translation_if_necessary_by" %in% names(cur_data())) first_non_empty(back_translation_if_necessary_by) else NA_character_,
+
+    amount_of_items_in_original_questionnaire =
+      if ("amount_of_items_in_original_questionnaire" %in% names(cur_data())) first_non_na_int(amount_of_items_in_original_questionnaire) else NA_integer_,
+    amount_of_items_in_guts_questionnaire =
+      if ("amount_of_items_in_guts_questionnaire" %in% names(cur_data())) first_non_na_int(amount_of_items_in_guts_questionnaire) else NA_integer_,
+
+    subscales_all =
+      list(if ("subscales" %in% names(cur_data())) unique_non_empty(subscales) else character(0)),
+    n_subscales =
+      if ("subscales" %in% names(cur_data())) length(unique_non_empty(subscales)) else 0L,
+    has_multiple_subscales = n_subscales > 1L,
+
+    has_prefix_items = any(is_prefix, na.rm = TRUE),
+    has_reversed_items = any(reversed_flag == 1L, na.rm = TRUE),
+    has_numeric_ranges = any(range_ok, na.rm = TRUE),
+    has_levels_info = any(levels_ok, na.rm = TRUE),
+
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(component, short_name)
+
+count_mismatch <- registry_measures %>%
+  dplyr::filter(!is.na(amount_of_items_in_guts_questionnaire)) %>%
+  dplyr::mutate(count_diff = n_items_manifest - amount_of_items_in_guts_questionnaire) %>%
+  dplyr::filter(count_diff != 0)
+
+if (nrow(count_mismatch) > 0) {
+  message("NOTE: Item-count mismatches detected (manifest vs amount_of_items_in_guts_questionnaire).")
+  print(
+    count_mismatch %>%
+      dplyr::select(component, short_name, n_items_manifest, amount_of_items_in_guts_questionnaire, count_diff),
+    n = 200
+  )
+}
+
+message("Registry items: ", nrow(registry_items), " rows.")
+message("Registry measures: ", nrow(registry_measures), " component x short_name blocks.")
+
+registry_measures_summary <- registry_measures %>%
+  dplyr::count(component, name = "n_measures") %>%
+  dplyr::arrange(component)
+
+print(registry_measures_summary)
+
+# Objects available downstream:
+#   - overview
+#   - registry_items
+#   - registry_measures
+
+```
+
+
+
+```{r}
+###############################################################################
+# CHUNK X) SPLIT MEASURES (FROM REGISTRY) + REVERSE CODING (T0)
+#
+# Purpose
+#   Build component-specific measure dataframes using registry_items, then apply
+#   reverse coding using registry_items metadata (reversed_flag + numeric ranges).
+#
+# Outputs
+#   - sensitive_measures_list_raw
+#   - questionnaire_measures_list_raw
+#   - sensitive_measures_list_rc
+#   - questionnaire_measures_list_rc
+#
+# Notes
+#   - Wave 0 has no sociometrics
+#   - Expected components are:
+#       * sensitive
+#       * questionnaire
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(stringr)
+  library(purrr)
+  library(tidyr)
+})
+
+stopifnot(exists("registry_items"))
+stopifnot(exists("demo_final"))
+stopifnot(exists("survey_final"))
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
+get_guts_col <- function(df) {
+  guts_candidates <- c("gutsID", "guts_id", "gutsid", "GUTSID", "GutsID")
+  guts_col <- guts_candidates[guts_candidates %in% names(df)][1]
+  if (is.na(guts_col)) stop("Could not find a gutsID column in dataset.")
+  guts_col
+}
+
+# Standardize registry once for downstream use
+registry_items2 <- registry_items %>%
+  mutate(
+    component = tolower(str_squish(as.character(component))),
+    short_name = str_squish(as.character(short_name)),
+    variable_name = str_squish(as.character(variable_name)),
+    variable_name_base = if ("variable_name_base" %in% names(.)) {
+      str_squish(as.character(variable_name_base))
+    } else {
+      str_remove(variable_name, "_$")
+    },
+    is_prefix = if ("is_prefix" %in% names(.)) {
+      as.logical(is_prefix)
+    } else {
+      str_ends(variable_name, "_")
+    }
+  )
+
+# --------------------------------------------------------------------------
+# Splitter (registry-driven)
+# --------------------------------------------------------------------------
+
+split_component_measures_registry <- function(df, component_name, registry_items_df) {
+
+  guts_col <- get_guts_col(df)
+
+  reg <- registry_items_df %>%
+    filter(component == component_name) %>%
+    filter(!is.na(short_name), short_name != "") %>%
+    filter(!is.na(variable_name), variable_name != "")
+
+  if (nrow(reg) == 0) {
+    message("No registry rows found for component: ", component_name)
+    return(list())
+  }
+
+  measures <- reg %>%
+    group_by(short_name) %>%
+    summarise(vars = list(variable_name), .groups = "drop") %>%
+    mutate(
+      data = purrr::map(vars, function(v) {
+
+        selected_cols <- character(0)
+
+        for (var in v) {
+
+          prefix <- if (str_ends(var, "_")) var else paste0(var, "_")
+          base   <- str_remove(var, "_$")
+
+          exact_candidates <- unique(c(var, base))
+          exact_match <- exact_candidates[exact_candidates %in% names(df)]
+          prefix_match <- names(df)[str_starts(names(df), fixed(prefix))]
+
+          if (length(exact_match) > 0 && length(prefix_match) > 0) {
+            selected_cols <- c(selected_cols, exact_match[1], prefix_match)
+          } else if (length(prefix_match) > 0) {
+            selected_cols <- c(selected_cols, prefix_match)
+          } else if (length(exact_match) > 0) {
+            selected_cols <- c(selected_cols, exact_match[1])
+          } else {
+            stop("Variable not found in ", component_name, ": ", var)
+          }
+        }
+
+        selected_cols <- unique(selected_cols)
+        keep_cols <- c(guts_col, selected_cols)
+
+        out <- df %>%
+          select(all_of(keep_cols))
+
+        if (guts_col != "gutsID") {
+          out <- out %>% rename(gutsID = all_of(guts_col))
+        }
+
+        out
+      })
+    )
+
+  out_list <- measures$data
+  names(out_list) <- measures$short_name
+  out_list
+}
+
+# --------------------------------------------------------------------------
+# Split lists (RAW)
+# --------------------------------------------------------------------------
+
+sensitive_measures_list_raw <- split_component_measures_registry(
+  demo_final,
+  "sensitive",
+  registry_items2
+)
+
+questionnaire_measures_list_raw <- split_component_measures_registry(
+  survey_final,
+  "questionnaire",
+  registry_items2
+)
+
+print(tibble(component = "sensitive",    n_measures = length(sensitive_measures_list_raw)))
+print(tibble(component = "questionnaire", n_measures = length(questionnaire_measures_list_raw)))
+
+# --------------------------------------------------------------------------
+# Reverse coding (registry-driven)
+# --------------------------------------------------------------------------
+
+apply_reverse_coding_registry <- function(measures_list_raw, component_name, registry_items_df) {
+
+  reg <- registry_items_df %>%
+    mutate(
+      component = tolower(str_squish(as.character(component))),
+      short_name = str_squish(as.character(short_name)),
+      variable_name = str_squish(as.character(variable_name))
+    ) %>%
+    filter(component == component_name) %>%
+    filter(reversed_flag == 1L) %>%
+    filter(range_ok) %>%
+    select(short_name, variable_name, scale_min, scale_max)
+
+  if (nrow(reg) == 0) {
+    message("Reverse coding (", component_name, "): no reversed items flagged with numeric ranges.")
+    return(measures_list_raw)
+  }
+
+  measures_list_rc <- purrr::imap(measures_list_raw, function(df, meas) {
+
+    info <- reg %>% filter(short_name == meas)
+    if (nrow(info) == 0) return(df)
+
+    for (i in seq_len(nrow(info))) {
+      v  <- info$variable_name[i]
+      mn <- info$scale_min[i]
+      mx <- info$scale_max[i]
+
+      if (v %in% names(df)) {
+        x_num <- suppressWarnings(as.numeric(df[[v]]))
+        df[[v]] <- ifelse(is.na(x_num), NA_real_, (mn + mx) - x_num)
+        next
+      }
+
+      prefix <- if (str_ends(v, "_")) v else paste0(v, "_")
+      prefixed_cols <- names(df)[str_starts(names(df), fixed(prefix))]
+
+      if (length(prefixed_cols) > 0) {
+        for (col in prefixed_cols) {
+          x_num <- suppressWarnings(as.numeric(df[[col]]))
+          df[[col]] <- ifelse(is.na(x_num), NA_real_, (mn + mx) - x_num)
+        }
+      }
+    }
+
+    df
+  })
+
+  rev_summary <- reg %>%
+    group_by(short_name) %>%
+    summarise(
+      n_reversed = n(),
+      reversed_vars = paste(variable_name, collapse = ", "),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(n_reversed))
+
+  message("Reverse-coding summary (", component_name, "):")
+  print(rev_summary, n = Inf)
+
+  measures_list_rc
+}
+
+sensitive_measures_list_rc <- apply_reverse_coding_registry(
+  sensitive_measures_list_raw,
+  "sensitive",
+  registry_items2
+)
+
+questionnaire_measures_list_rc <- apply_reverse_coding_registry(
+  questionnaire_measures_list_raw,
+  "questionnaire",
+  registry_items2
+)
+
+# Objects available downstream:
+#   - sensitive_measures_list_raw
+#   - questionnaire_measures_list_raw
+#   - sensitive_measures_list_rc
+#   - questionnaire_measures_list_rc
+
+```
+
+
+```{r}
+###############################################################################
+# STEP X) EXPORT OUTPUTS (WAVE 0)
+#
+# Exports into ONE root folder:
+#   <out_base_dir>/measures/
+#
+#   A) Measures (sensitive / questionnaire)
+#      - <out_meas_dir>/<short_name>/
+#
+# Receipts:
+#   <out_meas_dir>/_receipts/
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(stringr)
+  library(purrr)
+  library(readr)
+  library(haven)
+  library(tibble)
+})
+
+# ---- Config ----
+site_id <- "lei"
+ses_id  <- "00"
+
+out_base_dir <- file.path(dir0, "Behavioral", "T0", "data_processed")
+out_meas_dir <- file.path(out_base_dir, "measures")
+receipts_dir <- file.path(out_meas_dir, "_receipts")
+
+timestamp_now <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+
+# ---- Ensure folders exist ----
+dir.create(out_meas_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(receipts_dir, recursive = TRUE, showWarnings = FALSE)
+
+message("EXPORT ROOT (measures): ", out_meas_dir)
+message("  Receipts dir:         ", receipts_dir)
+
+# ---- Helpers ----
+assert_safe_name <- function(x) {
+  x <- as.character(x)
+  bad <- str_detect(x, "[\\\\/:*?\"<>|\\s]")
+  if (any(bad)) {
+    stop(
+      "Unsafe name(s) for folder/file naming (contains space or invalid path character): ",
+      paste(unique(x[bad]), collapse = ", ")
+    )
+  }
+}
+
+# --------------------------------------------------------------------------
+# A) MEASURES EXPORT -> TSV + RDS + SAV
+# --------------------------------------------------------------------------
+
+stopifnot(exists("sensitive_measures_list_rc"))
+stopifnot(exists("questionnaire_measures_list_rc"))
+
+export_sets <- list(
+  sensitive    = sensitive_measures_list_rc,
+  questionnaire = questionnaire_measures_list_rc
+)
+
+export_measure_set <- function(measures_list, component_name) {
+  if (length(measures_list) == 0) {
+    message("No measures to export for component: ", component_name)
+    return(tibble())
+  }
+
+  measure_names <- names(measures_list)
+  assert_safe_name(measure_names)
+
+  purrr::imap_dfr(measures_list, function(df, short_name) {
+
+    measure_dir <- file.path(out_meas_dir, short_name)
+    dir.create(measure_dir, recursive = TRUE, showWarnings = FALSE)
+
+    stem <- paste0("guts-", site_id, "_ses-", ses_id, "_task-", short_name)
+
+    path_tsv <- file.path(measure_dir, paste0(stem, ".tsv"))
+    path_rds <- file.path(measure_dir, paste0(stem, ".rds"))
+    path_sav <- file.path(measure_dir, paste0(stem, ".sav"))
+
+    readr::write_tsv(df, path_tsv, na = "")
+    saveRDS(df, path_rds)
+    haven::write_sav(df, path_sav)
+
+    tibble(
+      export_type = "measures",
+      component   = component_name,
+      short_name  = short_name,
+      n_rows      = nrow(df),
+      n_cols      = ncol(df),
+      path_tsv    = path_tsv,
+      path_rds    = path_rds,
+      path_sav    = path_sav,
+      timestamp   = timestamp_now
+    )
+  })
+}
+
+meas_receipt <- purrr::imap_dfr(export_sets, export_measure_set)
+
+meas_receipt_path <- file.path(receipts_dir, "export_receipt_measures.csv")
+readr::write_csv(meas_receipt, meas_receipt_path)
+
+message("Measures export complete. Receipt: ", meas_receipt_path)
+
+print(meas_receipt %>% count(component, name = "n_measures_exported"))
+message("All exports complete. Root: ", out_meas_dir)
+
+```
+
