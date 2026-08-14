@@ -1,0 +1,32 @@
+# Example private configuration for the GUTS WP2 behavioral cleaning scripts
+#
+# Copy this file to a location OUTSIDE the public repository and point
+# GUTS_PRIVATE_CONFIG to it.
+#
+# IMPORTANT:
+# - Never commit the real private configuration file.
+# - Never put participant names or other direct identifiers in this example file.
+# - Only define the objects needed by the wave(s) you are running.
+
+# Researcher/test names used for conservative test-response flagging.
+# Used by T0 and can also be supplied for other waves if needed.
+researcher_names <- character(0)
+
+# Participant-specific name corrections used before linkage.
+# Supply as a NAMED character vector:
+#   names = survey-side names
+#   values = corrected linkage-side names
+linkage_name_patches <- character(0)
+
+# Exact sociometric-column -> corrected nominee-name patches.
+# Used only by waves with sociometric processing.
+# Supply as a NAMED character vector:
+#   names = exact sociometric column names
+#   values = corrected nominee names
+sociometric_name_patches <- character(0)
+
+# Regex-based sociometric parsing corrections.
+# Supply as a NAMED character vector:
+#   names = regex patterns matching sociometric column names
+#   values = corrected nominee names
+sociometric_name_regex_patches <- character(0)
