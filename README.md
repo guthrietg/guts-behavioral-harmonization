@@ -1,7 +1,3 @@
-# guts-behavioral-harmonization
-Code for harmonising longitudinal behavioural, questionnaire, and social-network data across waves and work packages in the GUTS consortium.
-
-
 # GUTS WP2 Behavioral Data Cleaning
 
 This repository documents the behavioral data-cleaning workflow used for GUTS Work Package 2 (WP2) across Waves T0–T3.
